@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Offline Browser</title>
+<link rel="stylesheet" href="/static/styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><circle cx='32' cy='32' r='26' fill='none' stroke='%23b44bd8' stroke-width='6'/><path d='M6 32h52M32 6c12 14 12 38 0 52M32 6C20 20 20 44 32 58' fill='none' stroke='%235b6bff' stroke-width='4'/></svg>">
+</head>
+<body>
+
+<div class="chrome">
+  <div class="tabstrip" id="tabstrip">
+    <button class="tab-new" id="newTab" title="New tab (Alt+T)">+</button>
+  </div>
+
+  <div class="toolbar">
+    <button class="icon" id="back" title="Back (Alt+←)" disabled>‹</button>
+    <button class="icon" id="forward" title="Forward (Alt+→)" disabled>›</button>
+    <button class="icon" id="reload" title="Reload (Alt+R)">⟳</button>
+    <button class="icon" id="home" title="New tab page">⌂</button>
+
+    <div class="omnibox" id="omnibox">
+      <span class="sigil" id="sigil">◈</span>
+      <input id="address" placeholder="Search the imagined web, or type a domain — nothing here is real" spellcheck="false" autocomplete="off">
+      <button class="star" id="star" title="Add to favourites (Alt+S)">☆</button>
+      <button class="pill" id="regen" title="Imagine this page again from scratch">regenerate</button>
+      <div class="bar" id="bar"></div>
+    </div>
+
+    <button class="icon" id="historyBtn" title="History">◷</button>
+    <button class="icon" id="settingsBtn" title="Settings">⚙</button>
+    <span class="health" id="health" title="checking…"></span>
+  </div>
+
+  <div class="bookmarks" id="bookmarks" hidden></div>
+</div>
+
+<div class="viewport" id="viewport">
+  <div class="build" id="build" hidden>
+    <div class="build-card">
+      <div class="spinner"></div>
+      <div class="build-title" id="buildTitle">Building…</div>
+      <div class="build-sub" id="buildSub">Interactive pages appear once they are finished, so nothing runs half-written.</div>
+      <pre class="build-tail" id="buildTail"></pre>
+      <div class="build-count" id="buildCount"></div>
+    </div>
+  </div>
+</div>
+
+<div class="statusbar">
+  <span id="status"></span>
+  <span id="stats"></span>
+</div>
+
+<aside class="panel" id="historyPanel" hidden>
+  <div class="panel-head">
+    <b>History</b>
+    <span>
+      <button class="link" id="clearHistory">clear</button>
+      <button class="link" id="closeHistory">close</button>
+    </span>
+  </div>
+  <div class="panel-body" id="historyList"></div>
+</aside>
+
+<!-- ------------------------------------------------------------- settings -->
+<div class="modal" id="settingsModal" hidden>
+  <div class="sheet">
+    <div class="sheet-head">
+      <b>Settings</b>
+      <button class="link" id="closeSettings">close</button>
+    </div>
+
+    <label>Ollama endpoint
+      <input id="setUrl" spellcheck="false" placeholder="http://127.0.0.1:11434">
+    </label>
+
+    <label>Model
+      <span class="row">
+        <input id="setModel" spellcheck="false" placeholder="qwen3:8b" list="modelList">
+        <datalist id="modelList"></datalist>
+        <button class="pill" id="refreshModels">refresh</button>
+      </span>
+      <small id="modelNote"></small>
+    </label>
+
+    <div class="grid2">
+      <label>Web era
+        <select id="setStyle"></select>
+      </label>
+      <label>Page depth
+        <select id="setDepth"></select>
+        <small>Shorter pages arrive sooner.</small>
+      </label>
+    </div>
+
+    <div class="grid">
+      <label>Temperature <input id="setTemp" type="number" step="0.05" min="0" max="2"></label>
+      <label>Token ceiling <input id="setPredict" type="number" step="256" min="256" max="32768"></label>
+      <label>Context <input id="setCtx" type="number" step="1024" min="1024" max="131072"></label>
+    </div>
+
+    <div class="grid2">
+      <label>GPU layers
+        <input id="setGpu" type="number" step="1" min="-1" max="999">
+        <small>-1 lets Ollama decide, 99 forces all onto the GPU.</small>
+      </label>
+      <label>Keep model loaded
+        <input id="setKeep" spellcheck="false" placeholder="30m">
+        <small>Stays in VRAM, so the next page starts instantly.</small>
+      </label>
+    </div>
+
+    <label class="check"><input id="setPrefetch" type="checkbox"> Start writing a page when the pointer rests on its link</label>
+    <label class="check"><input id="setThink" type="checkbox"> Let reasoning models think first (much slower)</label>
+    <label class="check"><input id="setCache" type="checkbox"> Remember pages, so a URL you revisit is the same place</label>
+
+    <div class="sheet-foot">
+      <button class="pill danger" id="clearCache">forget every page</button>
+      <button class="pill primary" id="saveSettings">save</button>
+    </div>
+    <small id="settingsNote"></small>
+  </div>
+</div>
+
+<!-- --------------------------------------------------------------- wizard -->
+<div class="modal" id="wizard" hidden>
+  <div class="sheet">
+    <div class="sheet-head">
+      <b>Set up the model</b>
+      <button class="link" id="closeWizard">skip</button>
+    </div>
+    <div class="steps" id="wizSteps"></div>
+    <div class="wiz-actions" id="wizActions"></div>
+    <div class="progress-wrap" id="wizProgressWrap" hidden><div class="progress-bar" id="wizProgress"></div></div>
+    <pre class="wiz-log" id="wizLog" hidden></pre>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

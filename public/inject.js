@@ -1,0 +1,211 @@
+/* Runs inside every generated page.
+ *
+ * There is no network here. This turns the document into a citizen of the
+ * imagined web: links and forms become navigation requests to the chrome,
+ * <img> without a src gets painted from its alt text, and anything that tries
+ * to reach outside is turned off. (A CSP on the document says the same thing;
+ * this is the half that can hand the click back to the browser.)
+ */
+(function () {
+  var CFG = window.__OB__ || {};
+  var PAGE = CFG.url || 'https://example.com/';
+  var ORIGIN = CFG.origin || '';
+
+  function post(message) {
+    try {
+      message.__ob = true;
+      parent.postMessage(message, '*');
+    } catch (e) { /* nothing we can do from in here */ }
+  }
+
+  function resolve(href) {
+    if (!href) return null;
+    var raw = String(href).trim();
+    if (!raw || raw.charAt(0) === '#') return null;
+    if (/^(javascript|mailto|tel|data|blob|file):/i.test(raw)) return null;
+    if (/^ob:/i.test(raw)) return raw;
+    try {
+      return new URL(raw, PAGE).href;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function follow(url, opts) {
+    if (!url) return;
+    if (/^ob:/i.test(url)) {
+      post({ type: 'action', action: url.slice(3) });
+      return;
+    }
+    post({ type: 'navigate', url: url, newTab: !!(opts && opts.newTab), text: (opts && opts.text) || '' });
+  }
+
+  /* ------------------------------------------------------------- navigation */
+
+  function anchorFrom(node) {
+    while (node && node !== document) {
+      if (node.tagName === 'A' && node.getAttribute('href') !== null) return node;
+      node = node.parentNode;
+    }
+    return null;
+  }
+
+  document.addEventListener('click', function (e) {
+    var a = anchorFrom(e.target);
+    if (!a) return;
+    e.preventDefault();
+    follow(resolve(a.getAttribute('href')), {
+      newTab: e.ctrlKey || e.metaKey || a.getAttribute('target') === '_blank',
+      text: (a.textContent || '').trim().slice(0, 120)
+    });
+  }, true);
+
+  document.addEventListener('auxclick', function (e) {
+    if (e.button !== 1) return;
+    var a = anchorFrom(e.target);
+    if (!a) return;
+    e.preventDefault();
+    follow(resolve(a.getAttribute('href')), { newTab: true, text: (a.textContent || '').trim().slice(0, 120) });
+  }, true);
+
+  // A pointer resting on a link is the earliest hint of where you're going next,
+  // and a local model needs every second of head start it can get.
+  document.addEventListener('mouseover', function (e) {
+    var a = anchorFrom(e.target);
+    if (!a) return;
+    var url = resolve(a.getAttribute('href'));
+    if (url && !/^ob:/i.test(url)) {
+      post({ type: 'hover', url: url, text: (a.textContent || '').trim().slice(0, 120) });
+    }
+  }, true);
+
+  document.addEventListener('mouseout', function (e) {
+    if (anchorFrom(e.target)) post({ type: 'unhover' });
+  }, true);
+
+  // Search boxes are the point of a browser. Every form is a GET into the fake web.
+  document.addEventListener('submit', function (e) {
+    var form = e.target;
+    if (!form || form.tagName !== 'FORM') return;
+    e.preventDefault();
+
+    var target = resolve(form.getAttribute('action')) || PAGE;
+    var url;
+    try {
+      url = new URL(target);
+    } catch (err) {
+      return;
+    }
+
+    var fields = form.querySelectorAll('input, select, textarea');
+    var used = 0;
+    for (var i = 0; i < fields.length; i++) {
+      var field = fields[i];
+      var type = (field.type || '').toLowerCase();
+      if (!field.value || type === 'submit' || type === 'button' || type === 'file' || type === 'password') continue;
+      if ((type === 'checkbox' || type === 'radio') && !field.checked) continue;
+      url.searchParams.set(field.name || (used === 0 ? 'q' : 'field' + i), field.value);
+      used++;
+    }
+    follow(url.href, { text: 'search' });
+  }, true);
+
+  /* ----------------------------------------------------------------- images */
+
+  function paint(img) {
+    if (img.__ob) return;
+    img.__ob = 1;
+
+    var src = img.getAttribute('src') || '';
+    if (src.indexOf(ORIGIN + '/api/img') === 0) return;
+
+    var alt = img.getAttribute('alt') || '';
+    if (!alt && src) {
+      alt = decodeURIComponent(src.split('?')[0].split('/').pop() || '')
+        .replace(/\.[a-z0-9]+$/i, '')
+        .replace(/[-_+]+/g, ' ');
+    }
+
+    var w = parseInt(img.getAttribute('width'), 10) || 0;
+    var h = parseInt(img.getAttribute('height'), 10) || 0;
+    if (!w) {
+      var box = img.parentElement ? img.parentElement.clientWidth : 0;
+      w = Math.max(240, Math.min(1200, box || 800));
+    }
+    if (!h) h = Math.round(w * 0.5625);
+
+    img.removeAttribute('srcset');
+    img.src = ORIGIN + '/api/img?w=' + w + '&h=' + h + '&alt=' + encodeURIComponent(alt.slice(0, 180));
+  }
+
+  // Nothing can be embedded from outside, so give those boxes something to be.
+  function defuse(el) {
+    if (el.__ob) return;
+    el.__ob = 1;
+    var box = document.createElement('div');
+    box.textContent = '▶ embedded media';
+    box.setAttribute(
+      'style',
+      'display:flex;align-items:center;justify-content:center;min-height:170px;' +
+      'background:rgba(128,128,128,.14);border:1px dashed rgba(128,128,128,.4);border-radius:8px;' +
+      'font:13px system-ui,sans-serif;opacity:.65'
+    );
+    if (el.parentNode) el.parentNode.replaceChild(box, el);
+  }
+
+  function sweep() {
+    var imgs = document.getElementsByTagName('img');
+    for (var i = 0; i < imgs.length; i++) paint(imgs[i]);
+
+    var frames = document.querySelectorAll('iframe, object, embed');
+    for (var j = 0; j < frames.length; j++) defuse(frames[j]);
+
+    var sources = document.getElementsByTagName('source');
+    while (sources.length) sources[0].parentNode.removeChild(sources[0]);
+
+    if (document.title && document.title !== window.__obTitle) {
+      window.__obTitle = document.title;
+      post({ type: 'title', title: document.title });
+    }
+  }
+
+  window.__obSweep = sweep;
+
+  if (window.MutationObserver) {
+    new MutationObserver(sweep).observe(document.documentElement || document, { childList: true, subtree: true });
+  }
+  document.addEventListener('DOMContentLoaded', sweep);
+  window.addEventListener('load', sweep);
+  setTimeout(sweep, 60);
+
+  /* ------------------------------------------------------------ no outside */
+
+  try { window.fetch = function () { return Promise.reject(new TypeError('offline')); }; } catch (e) {}
+  try {
+    window.XMLHttpRequest = function () {
+      this.open = function () {};
+      this.send = function () { if (typeof this.onerror === 'function') this.onerror(new Error('offline')); };
+      this.setRequestHeader = function () {};
+      this.abort = function () {};
+      this.addEventListener = function () {};
+    };
+  } catch (e) {}
+  try { window.WebSocket = function () { throw new Error('offline'); }; } catch (e) {}
+  try { window.EventSource = function () { throw new Error('offline'); }; } catch (e) {}
+  try {
+    window.open = function (href) { follow(resolve(href), { newTab: true }); return null; };
+  } catch (e) {}
+
+  /* -------------------------------------------------- chrome keyboard keys */
+  // The page has focus while you play, so browser shortcuts have to be relayed.
+
+  var RELAY = { t: 1, w: 1, d: 1, r: 1, l: 1, ArrowLeft: 1, ArrowRight: 1 };
+  document.addEventListener('keydown', function (e) {
+    if (!(e.altKey || e.ctrlKey || e.metaKey)) return;
+    if (!RELAY[e.key]) return;
+    if (e.altKey) e.preventDefault();
+    post({ type: 'shortcut', key: e.key, alt: e.altKey, ctrl: e.ctrlKey, meta: e.metaKey, shift: e.shiftKey });
+  }, true);
+
+  post({ type: 'ready', url: PAGE });
+})();
