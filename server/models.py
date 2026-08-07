@@ -44,7 +44,7 @@ def fits(vram_gb: float) -> list[dict]:
 def recommend(vram_gb: float) -> dict:
     """The largest that fits.
 
-    Speed is a real concern for a browser, but that belongs to the Page depth
+    Speed is a real concern for a browser, but that belongs to the Effort
     setting rather than to a model two sizes below what the card can hold.
     """
     return fits(vram_gb)[-1]

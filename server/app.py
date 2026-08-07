@@ -12,19 +12,20 @@ from fastapi import Body, FastAPI, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import __version__, ollama, prefetch, setup as setup_mod, store
+from . import __version__, ollama, prefetch, prompts, setup as setup_mod, store
 from .generator import provider, stream_page
 from .img import svg_for
-from .prompts import DEPTH_PRESETS, STYLE_PRESETS
+from .prompts import EFFORT_PRESETS, STYLE_PRESETS
 
 PUBLIC = Path(__file__).resolve().parent.parent / "public"
 
 
 async def _warm_in_background():
-    """Load the weights now so the first page isn't paying for a cold start."""
+    """Load the weights now, and the prompt prefix with them, so the first page
+    isn't paying for a cold start of either."""
     settings = store.get_settings()
     try:
-        await provider(settings).warmup(settings)
+        await provider(settings).warmup(settings, prime=prompts.cache_prefix())
     except Exception:
         pass  # no model yet is a normal state; the wizard handles it
 
@@ -35,6 +36,7 @@ async def lifespan(app: FastAPI):
     task = asyncio.create_task(_warm_in_background())
     yield
     task.cancel()
+    await ollama.aclose()
 
 
 def _sse(events) -> StreamingResponse:
@@ -109,6 +111,13 @@ async def api_prefetch(
     return prefetch.start(q, referrer, text)
 
 
+@app.post("/api/prefetch/site")
+async def api_prefetch_site(domain: str = Query(..., description="a domain being typed, or sitting in a result")):
+    """Warm a site profile: the one call that blocks a page on a domain nobody
+    has visited. A fraction of a page's cost, so it is worth guessing at."""
+    return prefetch.warm_site(domain.strip().lower())
+
+
 @app.get("/api/img")
 async def api_img(alt: str = "", w: int = 800, h: int = 450):
     """Artwork for <img alt="..."> that the model left without a src."""
@@ -140,7 +149,7 @@ async def api_models():
 @app.post("/api/warmup")
 async def api_warmup():
     settings = store.get_settings()
-    return await provider(settings).warmup(settings)
+    return await provider(settings).warmup(settings, prime=prompts.cache_prefix())
 
 
 # ------------------------------------------------------------------ setup wizard
@@ -164,7 +173,16 @@ async def api_setup_serve():
 
 @app.post("/api/setup/pull")
 async def api_setup_pull(model: str = Query(..., description="e.g. qwen3:8b")):
+    ollama.forget_models()  # what's installed is about to change
     return _sse(setup_mod.pull_model(model))
+
+
+@app.post("/api/setup/tune")
+async def api_setup_tune():
+    """Flash attention and an 8-bit KV cache on the Ollama daemon: ~1.3 GB back,
+    which on a card that was only just missing is worth more than every other
+    setting here at once."""
+    return _sse(setup_mod.tune_daemon())
 
 
 # ----------------------------------------------------------------- preferences
@@ -176,7 +194,10 @@ async def api_get_settings():
     return {
         "settings": settings,
         "styles": [{"key": key, "label": value["label"]} for key, value in STYLE_PRESETS.items()],
-        "depths": [{"key": key, "label": value["label"]} for key, value in DEPTH_PRESETS.items()],
+        "efforts": [
+            {"key": key, "label": value["label"], "note": value["note"]}
+            for key, value in EFFORT_PRESETS.items()
+        ],
         "provider": provider(settings).PROVIDER,
         "mock": os.environ.get("OB_MOCK") == "1",
     }
@@ -184,6 +205,7 @@ async def api_get_settings():
 
 @app.put("/api/settings")
 async def api_put_settings(patch: dict = Body(default={})):
+    ollama.forget_models()  # the model or the endpoint may have just changed
     return {"settings": store.save_settings(patch)}
 
 

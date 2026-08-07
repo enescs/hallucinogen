@@ -63,10 +63,36 @@ def _http_error(exc: httpx.HTTPStatusError, settings: dict, model: str) -> Ollam
     return OllamaError(f"HTTP_{status}", f"Ollama responded {status}: {body or exc.response.reason_phrase}")
 
 
-def _client(settings: dict, *, streaming: bool) -> httpx.AsyncClient:
-    # Connect fast, but never time out a long generation mid-thought.
-    timeout = httpx.Timeout(connect=5.0, read=None if streaming else 120.0, write=30.0, pool=5.0)
-    return httpx.AsyncClient(base_url=_base(settings), timeout=timeout)
+# Connect fast, but never time out a long generation mid-thought. Callers that
+# expect an answer promptly -- /api/tags, /api/ps -- pass their own read timeout.
+_TIMEOUT = httpx.Timeout(connect=5.0, read=None, write=30.0, pool=5.0)
+
+_clients: dict[str, httpx.AsyncClient] = {}
+
+
+def _client(settings: dict) -> httpx.AsyncClient:
+    """One client per endpoint, kept open.
+
+    A client per call meant a TCP handshake per call, and the model is asked
+    something two or three times before a page starts arriving. Keyed by base
+    URL so pointing at a different Ollama in settings picks up a new one.
+    """
+    base = _base(settings)
+    client = _clients.get(base)
+    if client is None or client.is_closed:
+        client = httpx.AsyncClient(base_url=base, timeout=_TIMEOUT)
+        _clients[base] = client
+    return client
+
+
+async def aclose() -> None:
+    """Shut the pooled connections down with the server."""
+    for client in list(_clients.values()):
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+    _clients.clear()
 
 
 def _options(settings: dict, overrides: dict | None = None) -> dict:
@@ -75,6 +101,9 @@ def _options(settings: dict, overrides: dict | None = None) -> dict:
         "top_p": settings.get("topP", 0.95),
         "num_predict": settings.get("numPredict", 8192),
         "num_ctx": settings.get("numCtx", 8192),
+        # Prompt tokens per evaluation pass. A page carries ~1,500 of them, and
+        # the first one on a cold cache pays for all of it.
+        "num_batch": settings.get("numBatch", 512),
     }
     # num_gpu is the layer count offloaded to the GPU. -1 means "your call, Ollama".
     num_gpu = settings.get("numGpu", -1)
@@ -92,10 +121,9 @@ def _options(settings: dict, overrides: dict | None = None) -> dict:
 
 async def list_models(settings: dict) -> list[dict]:
     try:
-        async with _client(settings, streaming=False) as client:
-            response = await client.get("/api/tags", timeout=5.0)
-            response.raise_for_status()
-            data = response.json()
+        response = await _client(settings).get("/api/tags", timeout=5.0)
+        response.raise_for_status()
+        data = response.json()
     except httpx.HTTPStatusError as exc:
         raise _http_error(exc, settings, settings.get("model", "")) from exc
     except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
@@ -132,21 +160,41 @@ def _pick_model(wanted: str, names: list[str]) -> str:
     return qwen[0] if qwen else names[0]
 
 
+# What Ollama holds changes when somebody pulls, which is rare, and this is asked
+# once per navigation and again per site profile -- a round trip in front of every
+# page to re-learn something that was true a second ago.
+_MODEL_TTL = 60.0
+_model_cache: dict[str, tuple[float, str]] = {}
+
+
+def forget_models() -> None:
+    """After a pull, or a change of endpoint: ask again rather than trust the cache."""
+    _model_cache.clear()
+
+
 async def resolve_model(settings: dict) -> str:
+    wanted = settings.get("model", "")
+    key = f"{_base(settings)}|{wanted}"
+    cached = _model_cache.get(key)
+    now = time.monotonic()
+    if cached and now - cached[0] < _MODEL_TTL:
+        return cached[1]
+
     try:
         names = [m["name"] for m in await list_models(settings)]
     except OllamaError:
-        return settings.get("model", "")  # let the real call raise the real error
-    return _pick_model(settings.get("model", ""), names)
+        return wanted  # let the real call raise the real error
+    chosen = _pick_model(wanted, names)
+    _model_cache[key] = (now, chosen)
+    return chosen
 
 
 async def running(settings: dict) -> list[dict]:
     """`ollama ps` -- which models are loaded, and how much of each sits in VRAM."""
     try:
-        async with _client(settings, streaming=False) as client:
-            response = await client.get("/api/ps", timeout=5.0)
-            response.raise_for_status()
-            data = response.json()
+        response = await _client(settings).get("/api/ps", timeout=5.0)
+        response.raise_for_status()
+        data = response.json()
     except Exception:
         return []
     return data.get("models", []) or []
@@ -193,23 +241,40 @@ async def health(settings: dict) -> dict:
     }
 
 
-async def warmup(settings: dict, model: str | None = None) -> dict:
-    """Load the weights before anyone asks for a page, so the first one isn't a cold start."""
+async def warmup(settings: dict, model: str | None = None, prime: str = "") -> dict:
+    """Load the weights before anyone asks for a page, so the first one isn't a cold start.
+
+    Through _options, so the runner comes up under exactly the configuration the
+    first page will ask for. Ollama keys a loaded runner on num_ctx, num_gpu and
+    num_batch, so warming with any of them different loads the model twice: once
+    here, and again -- from cold, while somebody is waiting -- the moment a real
+    page disagrees with it.
+
+    `prime` is the prefix every real prompt opens with (prompts.cache_prefix()).
+    Weights in memory were only ever half of a cold start: the other half is the
+    ~1,100 tokens of rules in front of every page, and warming with "hi" left the
+    prompt cache empty for the first reader to fill. Sent as the system message
+    so it occupies the same position it will on every call after this, because
+    the cache matches from token zero and a prefix in the wrong place is a miss.
+    Generating one token is enough -- it is the prompt being evaluated that
+    matters, not the answer.
+    """
     model = model or await resolve_model(settings)
+    messages = [{"role": "system", "content": prime}] if prime else []
+    messages.append({"role": "user", "content": "hi"})
     body = {
         "model": model,
-        "messages": [{"role": "user", "content": "hi"}],
+        "messages": messages,
         "stream": False,
         "keep_alive": settings.get("keepAlive", "30m"),
-        "options": {"num_predict": 1, "num_ctx": settings.get("numCtx", 8192)},
+        "options": _options(settings, {"num_predict": 1}),
     }
     started = time.monotonic()
     try:
-        async with _client(settings, streaming=True) as client:
-            response = await client.post(
-                "/api/chat", json=body, timeout=httpx.Timeout(connect=5.0, read=600.0, write=30.0, pool=5.0)
-            )
-            response.raise_for_status()
+        response = await _client(settings).post(
+            "/api/chat", json=body, timeout=httpx.Timeout(connect=5.0, read=600.0, write=30.0, pool=5.0)
+        )
+        response.raise_for_status()
     except Exception as err:
         return {"ok": False, "model": model, "error": str(err)}
     return {"ok": True, "model": model, "ms": round((time.monotonic() - started) * 1000)}
@@ -239,18 +304,18 @@ async def chat_stream(
     if fmt is not None:
         body["format"] = fmt
 
-    async with _client(settings, streaming=True) as client:
-        for attempt in range(2):
-            try:
-                async for event in _stream_once(client, body, settings, model):
-                    yield event
-                return
-            except OllamaError as err:
-                # Older daemons and non-reasoning models reject `think` outright.
-                if attempt == 0 and "think" in err.message.lower() and "think" in body:
-                    body.pop("think")
-                    continue
-                raise
+    client = _client(settings)
+    for attempt in range(2):
+        try:
+            async for event in _stream_once(client, body, settings, model):
+                yield event
+            return
+        except OllamaError as err:
+            # Older daemons and non-reasoning models reject `think` outright.
+            if attempt == 0 and "think" in err.message.lower() and "think" in body:
+                body.pop("think")
+                continue
+            raise
 
 
 async def _stream_once(client: httpx.AsyncClient, body: dict, settings: dict, model: str) -> AsyncIterator[dict]:

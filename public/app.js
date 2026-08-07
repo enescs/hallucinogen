@@ -20,11 +20,12 @@ const state = {
   seq: 0,
   inject: '',
   settings: {},
-  meta: { styles: [], depths: [], provider: 'ollama', mock: false },
+  meta: { styles: [], efforts: [], provider: 'ollama', mock: false },
   health: null,
   setup: null,
   bookmarks: [],
   hoverTimer: null,
+  hoverSiteTimer: null,
   hoverUrl: '',
 };
 
@@ -48,7 +49,7 @@ async function loadSettings() {
   try {
     const data = await fetch('/api/settings').then((r) => r.json());
     state.settings = data.settings || {};
-    state.meta = { styles: data.styles || [], depths: data.depths || [], provider: data.provider, mock: data.mock };
+    state.meta = { styles: data.styles || [], efforts: data.efforts || [], provider: data.provider, mock: data.mock };
   } catch (err) {
     setStatus('Could not read settings from the browser server.');
   }
@@ -57,7 +58,7 @@ async function loadSettings() {
 /* ------------------------------------------------------- entries and frames */
 
 function newEntry(url) {
-  return { url, title: '', html: '', mode: 'page', scroll: 0, frame: null, open: false };
+  return { url, title: '', html: '', mode: 'page', scroll: 0, frame: null, open: false, pending: '', flush: 0 };
 }
 
 function entryOf(tab) {
@@ -82,6 +83,7 @@ function ensureFrame(tab, entry) {
 
 function dropFrame(entry) {
   if (!entry.frame) return;
+  discardPending(entry);
   entry.frame.remove();
   entry.frame = null;
   entry.open = false;
@@ -223,7 +225,10 @@ function syncChrome() {
   setStatus(tab.status);
   $('stats').textContent = tab.stats;
   document.title = (tab.title || 'Offline Browser') + ' — Offline Browser';
-  $('build').hidden = !(tab.loading && tab.mode === 'app' && !tab.cached);
+  // Apps used to hide behind this while the whole document was buffered. They
+  // stream now -- only their <script> is held back -- so there is nothing to
+  // hide, and watching the page assemble beats watching a progress panel.
+  $('build').hidden = true;
   syncStar();
 }
 
@@ -262,17 +267,41 @@ function framePrefix(url) {
 
 function openDoc(entry) {
   const doc = entry.frame.contentDocument;
+  discardPending(entry);  // doc.open() wipes the document; anything queued was for the old one
   doc.open();
   doc.write(framePrefix(entry.url));
   entry.open = true;
 }
 
+/* Tokens arrive far faster than a screen refreshes, and every document.write is
+ * an incremental parse and a reflow. Writing each one as it lands meant hundreds
+ * of layouts a second for a page nobody can read that quickly -- work that comes
+ * out of the same CPU the model is using whenever it isn't fully on the GPU.
+ * One write per frame paints exactly as often as the display can show it. */
 function writeDoc(entry, text) {
   if (!entry.open) openDoc(entry);
-  entry.frame.contentDocument.write(text);
+  entry.pending += text;
+  if (!entry.flush) {
+    entry.flush = requestAnimationFrame(() => { entry.flush = 0; flushDoc(entry); });
+  }
+}
+
+function flushDoc(entry) {
+  if (entry.flush) { cancelAnimationFrame(entry.flush); entry.flush = 0; }
+  const text = entry.pending;
+  entry.pending = '';
+  if (!text || !entry.open || !entry.frame) return;
+  try { entry.frame.contentDocument.write(text); } catch (e) { /* the frame went away */ }
+}
+
+/* Nothing half-written survives a restart or a dropped frame. */
+function discardPending(entry) {
+  if (entry.flush) { cancelAnimationFrame(entry.flush); entry.flush = 0; }
+  entry.pending = '';
 }
 
 function closeDoc(entry) {
+  flushDoc(entry);
   if (!entry.open) return;
   try { entry.frame.contentDocument.close(); } catch (e) { /* already gone */ }
   entry.open = false;
@@ -343,6 +372,13 @@ async function navigate(tab, input, opts) {
   const push = opts.push !== false;
 
   stop(tab);
+  /* Whatever the pointer was resting on, it isn't being guessed at any more --
+   * the server cancels every speculation the moment anything actually goes. If
+   * this stays set, hovering that same link again is a no-op, and a guess that
+   * was cancelled halfway never gets started a second time. */
+  clearTimeout(state.hoverTimer);
+  clearTimeout(state.hoverSiteTimer);
+  state.hoverUrl = '';
   if (input === NEW_TAB) return void showNewTab(tab, push);
 
   let entry;
@@ -468,6 +504,7 @@ function handle(tab, entry, type, data, ctx) {
       // The model wandered off. Throw away what we have and take it again.
       tab.buffer = '';
       tab.chars = 0;
+      discardPending(entry);
       entry.open = false;
       if (data.text) setStatus(data.text);
       break;
@@ -476,7 +513,9 @@ function handle(tab, entry, type, data, ctx) {
     case 'chunk': {
       tab.chars += data.text.length;
       tab.buffer += data.text;                      // always kept, so back can rebuild
-      const stream = tab.mode === 'page' && !tab.cached;
+      // Apps stream too: the server holds their <script> back until it is whole,
+      // so what arrives before it is page furniture and safe to paint.
+      const stream = !tab.cached;
       if (stream) writeDoc(entry, data.text);
 
       if (tab.id === state.activeId) {
@@ -491,7 +530,7 @@ function handle(tab, entry, type, data, ctx) {
 
     case 'done': {
       entry.html = tab.buffer;
-      const streamed = tab.mode === 'page' && !tab.cached && entry.open;
+      const streamed = !tab.cached && entry.open;
       if (streamed) closeDoc(entry);
       else renderWhole(entry, tab.buffer);
       tab.buffer = '';
@@ -501,6 +540,7 @@ function handle(tab, entry, type, data, ctx) {
       setTitle(tab, data.title);
       syncChrome();
       focusPage(tab);
+      if (tab.mode === 'search') warmResultSites(entry);
 
       const ms = Math.round(performance.now() - ctx.started);
       const bits = [];
@@ -590,7 +630,7 @@ function showNewTab(tab, push) {
 
 const SUGGESTIONS = [
   ['mirage.search', 'the search engine of a web that is not there'],
-  ['cabinet.arcade/play/pacman', 'something to play'],
+  ['cabinet.arcade/play/', 'something to play'],
   ['instagram.com', 'what the model thinks it looks like'],
   ['en.wikipedia.org/wiki/Antikythera_mechanism', 'an encyclopaedia entry'],
   ['news.ycombinator.com', 'an orange front page'],
@@ -704,6 +744,7 @@ window.addEventListener('message', (event) => {
 
     case 'unhover':
       clearTimeout(state.hoverTimer);
+      clearTimeout(state.hoverSiteTimer);
       break;
 
     case 'title':
@@ -723,17 +764,76 @@ window.addEventListener('message', (event) => {
   }
 });
 
-/* Hovering a link is a good guess at the next page, and the model needs the head start. */
+/* A site profile is ~220 tokens against a page's thousands, so it is worth
+ * guessing at on much weaker evidence than a hover: a half-typed address, a
+ * domain sitting in a search result. The server dedupes by domain, so guessing
+ * the same one twice costs nothing, and a real navigation joins the job in
+ * flight rather than starting a second. */
+const warmed = new Set();
+
+function warmSite(domain) {
+  if (!state.settings.prefetch || !domain || warmed.has(domain) || !domain.includes('.')) return;
+  warmed.add(domain);
+  fetch('/api/prefetch/site?domain=' + encodeURIComponent(domain), { method: 'POST' }).catch(() => {});
+}
+
+function domainOf(text) {
+  const raw = String(text || '').trim().toLowerCase();
+  if (!raw || /\s/.test(raw)) return '';                       // a search, not an address
+  const host = raw.replace(/^https?:\/\//, '').split(/[/?#]/)[0];
+  return /^[a-z0-9.-]+\.[a-z]{2,}$/.test(host) ? host : '';
+}
+
+function warmSiteFor(text) {
+  clearTimeout(state.typeTimer);
+  const domain = domainOf(text);
+  if (!domain) return;
+  state.typeTimer = setTimeout(() => warmSite(domain), 400);   // once they stop typing
+}
+
+/* A results page is a list of domains about to be clicked. Warm the first few
+ * profiles while the reader is still reading, so the click lands on a page that
+ * can start writing immediately. */
+function warmResultSites(entry) {
+  try {
+    const doc = entry.frame && entry.frame.contentDocument;
+    if (!doc) return;
+    const seen = [];
+    doc.querySelectorAll('a.title[href]').forEach((link) => {
+      const domain = domainOf(link.getAttribute('href'));
+      if (domain && !seen.includes(domain)) seen.push(domain);
+    });
+    seen.slice(0, 3).forEach(warmSite);
+  } catch (e) { /* the frame went away mid-thought */ }
+}
+
+/* Hovering a link is a guess at the next page, and the two things worth guessing
+ * cost wildly different amounts -- so they wait different lengths of time.
+ *
+ * The site profile is ~220 tokens and is wanted by every page on the domain, so
+ * a glance is evidence enough: even if the reader never clicks, the next visitor
+ * to that domain gets it free. A whole page is ~2,300 tokens and takes the model
+ * off everything else for the duration, which is the entire cost of a wrong
+ * guess -- the reader who then clicks somewhere else waits for a page nobody
+ * will ever read. That one wants to be sure, so it waits for a rest rather than
+ * a pass. 220ms used to buy both, which meant sweeping the pointer across a
+ * paragraph of links committed the model to whichever one it crossed first. */
+const HOVER_SITE_MS = 90;
+const HOVER_PAGE_MS = 650;
+
 function queuePrefetch(tab, url, text) {
   if (!state.settings.prefetch || !url || !url.startsWith('http')) return;
   if (url === state.hoverUrl) return;
   clearTimeout(state.hoverTimer);
+  clearTimeout(state.hoverSiteTimer);
+
+  state.hoverSiteTimer = setTimeout(() => warmSite(domainOf(url)), HOVER_SITE_MS);
   state.hoverTimer = setTimeout(() => {
     state.hoverUrl = url;
     const params = new URLSearchParams({ q: url, text: text || '' });
     if (tab.url.startsWith('http')) params.set('from', tab.url);
     fetch('/api/prefetch?' + params, { method: 'POST' }).catch(() => {});
-  }, 220);
+  }, HOVER_PAGE_MS);
 }
 
 /* -------------------------------------------------------------- favourites */
@@ -859,6 +959,9 @@ function wire() {
     $('address').blur();
   });
   $('address').addEventListener('focus', () => $('address').select());
+  // Typing a domain is the earliest possible warning that its profile will be
+  // wanted, and the profile is the one call that blocks a page on a new site.
+  $('address').addEventListener('input', () => warmSiteFor($('address').value));
 
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') { const tab = active(); if (tab && tab.loading) { stop(tab); syncChrome(); } return; }
@@ -876,6 +979,7 @@ function wire() {
   $('refreshModels').onclick = loadModels;
   $('clearCache').onclick = async () => {
     const res = await fetch('/api/cache', { method: 'DELETE' }).then((r) => r.json());
+    warmed.clear();  // those domains have no profile any more, so they are worth warming again
     $('settingsNote').textContent =
       `Forgot ${res.pages} pages${res.kept ? `, kept ${res.kept} belonging to favourites` : ''}. `
       + 'Those URLs will be imagined afresh — as different places.';
@@ -915,13 +1019,14 @@ function openSettings() {
   $('setPredict').value = s.numPredict;
   $('setCtx').value = s.numCtx;
   $('setGpu').value = s.numGpu;
+  $('setBatch').value = s.numBatch;
   $('setKeep').value = s.keepAlive || '30m';
   $('setThink').checked = !!s.think;
   $('setCache').checked = !!s.useCache;
   $('setPrefetch').checked = !!s.prefetch;
 
   fill($('setStyle'), state.meta.styles, s.style);
-  fill($('setDepth'), state.meta.depths, s.depth);
+  fill($('setEffort'), state.meta.efforts, s.effort);
 
   $('settingsNote').textContent = state.meta.mock ? 'Running the mock provider (OB_MOCK=1) — no model is involved.' : '';
   $('settingsModal').hidden = false;
@@ -933,7 +1038,7 @@ function fill(select, options, chosen) {
   (options || []).forEach((option) => {
     const el = document.createElement('option');
     el.value = option.key;
-    el.textContent = option.label;
+    el.textContent = option.note ? option.label + ' — ' + option.note : option.label;
     if (option.key === chosen) el.selected = true;
     select.appendChild(el);
   });
@@ -964,9 +1069,10 @@ async function saveSettings() {
     numPredict: Number($('setPredict').value),
     numCtx: Number($('setCtx').value),
     numGpu: Number($('setGpu').value),
+    numBatch: Number($('setBatch').value),
     keepAlive: $('setKeep').value,
     style: $('setStyle').value,
-    depth: $('setDepth').value,
+    effort: $('setEffort').value,
     think: $('setThink').checked,
     useCache: $('setCache').checked,
     prefetch: $('setPrefetch').checked,
@@ -1033,6 +1139,21 @@ function renderWizard() {
     },
   ];
 
+  /* Only worth a line once there is a model loaded to say something about --
+   * and then it is the most important line here, because a model that is only
+   * half on the GPU is slower than every other setting in this program combined. */
+  const tuning = s.tuning || {};
+  if (s.gpu && s.gpu.loaded) {
+    const whole = s.gpu.percent >= 100;
+    steps.push({
+      done: whole,
+      title: whole ? 'Model fully on the GPU' : 'Model only partly on the GPU',
+      note: whole
+        ? `${s.gpu.percent}% in video memory`
+        : `${s.gpu.percent}% in video memory — the rest runs on the CPU, which is where the slowness is`,
+    });
+  }
+
   $('wizSteps').innerHTML = steps.map((step) =>
     `<div class="step ${step.done ? 'done' : ''}"><span class="mark">${step.done ? '✓' : '○'}</span>
      <div><b>${esc(step.title)}</b><small>${esc(step.note)}</small></div></div>`).join('');
@@ -1082,6 +1203,26 @@ function renderWizard() {
     actions.insertAdjacentHTML('beforeend', `<div class="wiz-note">${esc(gpu)}. Downloads once, then stays put.</div>`);
   } else {
     actions.innerHTML = `<div class="wiz-note">Ready: <b>${esc(s.configuredModel)}</b> on ${esc(s.endpoint)}. ${esc(gpu)}.</div>`;
+
+    /* The one remaining thing worth pressing. Offered last so it never stands
+     * between anyone and a working browser, and only while it would change
+     * something -- once both variables are set there is nothing to say. */
+    if (tuning.supported && !tuning.applied) {
+      const squeezed = s.gpu && s.gpu.loaded && s.gpu.percent < 100;
+      if (tuning.canApply) {
+        actions.appendChild(button('Free up video memory', squeezed ? 'primary' : '', () => runSetup('/api/setup/tune')));
+      }
+      actions.insertAdjacentHTML('beforeend', `<div class="wiz-note">
+        Flash attention and an 8-bit KV cache on the Ollama daemon give back ${esc(tuning.saves)} —
+        ${squeezed
+          ? 'which is what is currently keeping part of the model off the GPU.'
+          : 'headroom for a larger context or a larger model.'}
+        ${tuning.canApply
+          ? 'Restarts Ollama, which takes a few seconds.'
+          : `Needs admin rights this page can't ask for — run this instead:<code>${esc(tuning.command)}</code>`}
+      </div>`);
+    }
+
     actions.appendChild(button('Start browsing', 'primary', () => { $('wizard').hidden = true; }));
   }
 }

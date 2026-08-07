@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
 import shutil
 import subprocess
 from typing import AsyncIterator
@@ -130,10 +131,149 @@ async def status() -> dict:
         "configuredPresent": settings.get("model") in models,
         "recommend": suggestion,
         "gpu": health.get("gpu", {}),
+        "tuning": tuning_status(),
         "canInstall": can_install_unattended(),
         "installCommand": f"curl -fsSL {INSTALL_URL} | sh",
         "tiers": [{**tier, "fits": tier in fits(vram)} for tier in reversed(TIERS)],
     }
+
+
+# ------------------------------------------------------------------ daemon tuning
+#
+# Two environment variables on the Ollama daemon shrink the KV cache by roughly
+# 1.3 GB at an 8k context. That is not a tuning detail: on an 8 GB card qwen3:8b
+# fits with nothing to spare, and the difference between fitting and not fitting
+# is the difference between 45 tokens a second and 6. Partial offload costs more
+# than every setting in this program put together, so it is worth a button.
+#
+# They belong to the daemon, not to a request, so nothing in the API can set them
+# -- it is a systemd drop-in and a restart, which is why this is here and not in
+# ollama.py.
+
+TUNING = {
+    "OLLAMA_FLASH_ATTENTION": "1",  # cheaper attention, less memory held per token
+    "OLLAMA_KV_CACHE_TYPE": "q8_0",  # 8-bit KV cache: about half the size, no visible quality cost
+    # Ollama sizes the KV cache at num_ctx *times* this, and left to itself it
+    # will pick 4 when it thinks there is room -- which turns an 8k context into
+    # 32k of cache and is the likeliest single reason a model that should fit
+    # ends up half on the GPU. One reader, one model, one page at a time: the
+    # other three slots are never used, and they cost more than everything else
+    # on this list. They also cost the prompt cache, because requests round-robin
+    # across slots and each one only remembers what went through it -- so the
+    # ~1,100-token prefix in front of every page misses three times in four.
+    "OLLAMA_NUM_PARALLEL": "1",
+}
+
+UNIT = "ollama"
+OVERRIDE_DIR = "/etc/systemd/system/ollama.service.d"
+OVERRIDE_FILE = f"{OVERRIDE_DIR}/10-offline-browser.conf"
+
+_OVERRIDE_BODY = "[Service]\n" + "".join(f'Environment="{k}={v}"\n' for k, v in TUNING.items())
+
+MANUAL_COMMAND = "systemctl edit ollama   # then add, under [Service]:\n" + "".join(
+    f'Environment="{k}={v}"\n' for k, v in TUNING.items()
+)
+
+
+def _systemd_unit_exists() -> bool:
+    if not shutil.which("systemctl"):
+        return False
+    try:
+        out = subprocess.run(
+            ["systemctl", "list-unit-files", f"{UNIT}.service"], capture_output=True, text=True, timeout=6
+        )
+        return f"{UNIT}.service" in (out.stdout or "")
+    except Exception:
+        return False
+
+
+def daemon_env() -> dict:
+    """What the running ollama unit actually has set, as far as systemd will say."""
+    if not shutil.which("systemctl"):
+        return {}
+    try:
+        out = subprocess.run(
+            ["systemctl", "show", UNIT, "--property=Environment"], capture_output=True, text=True, timeout=6
+        ).stdout
+    except Exception:
+        return {}
+    found = {}
+    for token in (out.split("=", 1)[-1] if "=" in out else "").strip().split():
+        if "=" in token:
+            key, _, value = token.partition("=")
+            found[key] = value.strip('"')
+    return found
+
+
+def tuning_status() -> dict:
+    """Is the daemon tuned, can we tune it from here, and what would it take."""
+    systemd = _systemd_unit_exists()
+    env = daemon_env() if systemd else {}
+    missing = [key for key, value in TUNING.items() if env.get(key) != value]
+    return {
+        "supported": systemd,
+        "applied": systemd and not missing,
+        "missing": missing,
+        "current": {key: env.get(key, "") for key in TUNING},
+        "canApply": systemd and can_install_unattended(),
+        "command": MANUAL_COMMAND,
+        "saves": "several GB of KV cache at an 8k context, and every prompt cache hit",
+    }
+
+
+async def tune_daemon() -> AsyncIterator[dict]:
+    """Write the drop-in and restart Ollama. Needs root or passwordless sudo."""
+    status_now = tuning_status()
+    if not status_now["supported"]:
+        yield {
+            "type": "error",
+            "message": "This Ollama isn't running under systemd, so there's no unit to edit.",
+            "hint": "Export these before `ollama serve` instead:  "
+            + "  ".join(f"{k}={v}" for k, v in TUNING.items()),
+        }
+        return
+    if status_now["applied"]:
+        yield {"type": "log", "text": "the daemon already has both settings"}
+        yield {"type": "exit", "code": 0}
+        return
+    if not status_now["canApply"]:
+        yield {
+            "type": "error",
+            "message": "Editing the Ollama service needs administrator rights, which this page can't ask for.",
+            "hint": f"Run this in a terminal instead:  {MANUAL_COMMAND}",
+        }
+        return
+
+    prefix = "" if os.geteuid() == 0 else "sudo -n "
+    yield {"type": "log", "text": f"writing {OVERRIDE_FILE}"}
+
+    # Piped through tee because only the write needs to be elevated. shlex.quote
+    # rather than json.dumps: the body is multi-line, and printf '%s' does not
+    # interpret escapes -- a JSON-quoted string would land in the unit file with
+    # a literal backslash-n in it, which systemd would read as one long setting.
+    script = (
+        f"{prefix}mkdir -p {OVERRIDE_DIR} && "
+        f"printf '%s' {shlex.quote(_OVERRIDE_BODY)} | {prefix}tee {OVERRIDE_FILE} >/dev/null && "
+        f"{prefix}systemctl daemon-reload && "
+        f"{prefix}systemctl restart {UNIT}"
+    )
+    async for event in _stream_command(script, shell=True):
+        if event.get("type") == "exit" and event.get("code") == 0:
+            yield {"type": "log", "text": "restarted ollama; the model will reload on the next page"}
+            ollama.forget_models()
+        yield event
+
+    # The restart drops the loaded model, so the browser's own warm-up has to
+    # happen again or the next page pays a cold start on top of this.
+    settings = store.get_settings()
+    for _ in range(20):
+        await asyncio.sleep(0.5)
+        if (await ollama.health(settings)).get("ok"):
+            yield {"type": "log", "text": "ollama is back; warming the model"}
+            await ollama.warmup(settings)
+            yield {"type": "log", "text": "ready"}
+            return
+    yield {"type": "log", "text": "ollama has not come back yet — check `systemctl status ollama`"}
 
 
 async def _stream_command(command: list[str] | str, shell: bool = False) -> AsyncIterator[dict]:

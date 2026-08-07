@@ -32,8 +32,17 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "numPredict": 8192,  # hard ceiling; `depth` sets the real target
     "numCtx": 8192,
     "numGpu": -1,  # -1 lets Ollama decide, 99 forces every layer onto the GPU
+    # How many prompt tokens are evaluated per pass. Ollama's own default is 512,
+    # and a page carries ~1,500 of them; doubling it halves the number of passes
+    # before the first word appears. It costs a larger compute buffer in VRAM --
+    # a hundred megabytes or so -- which used to be reason enough to leave it
+    # alone, because the card that would notice is the card already only just
+    # fitting the model. The setup panel now pins OLLAMA_NUM_PARALLEL to 1, which
+    # hands back whole gigabytes of KV cache on the same card, so the trade is no
+    # longer close.
+    "numBatch": 1024,
     "keepAlive": "30m",  # keep the model resident so page two isn't a cold start
-    "depth": "standard",
+    "effort": "normal",  # how much the model is asked to write, everywhere at once
     "prefetch": True,
     "think": False,  # reasoning first is a latency tax on every page
     "style": "modern",
@@ -46,9 +55,10 @@ NUMERIC_BOUNDS = {
     "numPredict": (256, 32768),
     "numCtx": (1024, 131072),
     "numGpu": (-1, 999),
+    "numBatch": (64, 4096),
 }
 
-_INT_SETTINGS = ("numPredict", "numCtx", "numGpu")
+_INT_SETTINGS = ("numPredict", "numCtx", "numGpu", "numBatch")
 
 _settings_cache: dict[str, Any] | None = None
 
@@ -65,10 +75,10 @@ def _read_json(path: Path, fallback):
         return fallback
 
 
-def _write_json(path: Path, value) -> None:
+def _write_json(path: Path, value, indent: int | None = 2) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(value, indent=2, ensure_ascii=False), "utf-8")
+    tmp.write_text(json.dumps(value, indent=indent, ensure_ascii=False), "utf-8")
     tmp.replace(path)
 
 
@@ -83,10 +93,18 @@ def _safe_domain(domain: str) -> str:
 # --------------------------------------------------------------------- settings
 
 
+_LEGACY_DEPTHS = {"quick": "light", "standard": "normal", "rich": "full"}
+
+
 def get_settings() -> dict[str, Any]:
     global _settings_cache
     if _settings_cache is None:
-        _settings_cache = {**DEFAULT_SETTINGS, **_read_json(SETTINGS_FILE, {})}
+        stored = _read_json(SETTINGS_FILE, {}) or {}
+        # `depth` set page length; `effort` sets that and everything else that
+        # costs tokens. A settings file written before the rename still works.
+        if "effort" not in stored and stored.get("depth") in _LEGACY_DEPTHS:
+            stored["effort"] = _LEGACY_DEPTHS[stored["depth"]]
+        _settings_cache = {**DEFAULT_SETTINGS, **{k: v for k, v in stored.items() if k in DEFAULT_SETTINGS}}
     return dict(_settings_cache)
 
 
@@ -116,6 +134,17 @@ def save_settings(patch: dict[str, Any]) -> dict[str, Any]:
 # ------------------------------------------------------------------------ pages
 
 
+def has_page(url: str) -> bool:
+    """Is this URL remembered? Without reading the page to find out.
+
+    A page record carries the whole document, so the callers that only need a
+    yes or no -- the prefetch guards, which run on the same loop as somebody
+    else's live stream -- should not be parsing a couple of hundred kilobytes
+    of JSON to get one.
+    """
+    return (PAGES / f"{_key(url)}.json").exists()
+
+
 def get_page(url: str) -> dict | None:
     return _read_json(PAGES / f"{_key(url)}.json", None)
 
@@ -129,7 +158,10 @@ def put_page(url: str, title: str, html: str, model: str, mode: str = "page") ->
         "mode": mode,
         "createdAt": time.time(),
     }
-    _write_json(PAGES / f"{_key(url)}.json", record)
+    # No indent here, unlike everything else under data/. A page record is one
+    # long HTML string and a few short fields; indenting it prettifies nothing
+    # and re-encodes the whole document to do it.
+    _write_json(PAGES / f"{_key(url)}.json", record, indent=None)
     return record
 
 

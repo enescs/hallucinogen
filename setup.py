@@ -294,7 +294,7 @@ def ensure_model() -> str | None:
         say(f"   {marker} {tier['model']:<12} {tier['download']:<9} {DIM}{tier['note']}{RESET} {room}")
     say("")
     say(f"  suggested: {BOLD}{best['model']}{RESET} — the largest that fits your card")
-    say(f"  {DIM}if pages feel slow, take one size down, or set Page depth to Quick in the browser{RESET}")
+    say(f"  {DIM}if pages feel slow, take one size down, or turn Effort down in the browser{RESET}")
 
     if sys.stdin.isatty():
         chosen = input(f"  Model to pull [{best['model']}]: ").strip() or best["model"]

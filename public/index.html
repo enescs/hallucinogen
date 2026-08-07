@@ -89,9 +89,9 @@
       <label>Web era
         <select id="setStyle"></select>
       </label>
-      <label>Page depth
-        <select id="setDepth"></select>
-        <small>Shorter pages arrive sooner.</small>
+      <label>Effort
+        <select id="setEffort"></select>
+        <small>How much the model is asked to write — page length, search results, all of it. The single biggest lever on speed.</small>
       </label>
     </div>
 
@@ -109,6 +109,11 @@
       <label>Keep model loaded
         <input id="setKeep" spellcheck="false" placeholder="30m">
         <small>Stays in VRAM, so the next page starts instantly.</small>
+      </label>
+      <label>Prompt batch
+        <input id="setBatch" type="number" step="64" min="64" max="4096">
+        <small>Prompt tokens read per pass. 1024 speeds up the wait before the
+          first word, if there is VRAM to spare.</small>
       </label>
     </div>
 

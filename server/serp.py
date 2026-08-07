@@ -8,6 +8,8 @@ time. Everything on it is a real link into the imagined web.
 from __future__ import annotations
 
 import html as html_mod
+import json
+import re
 from urllib.parse import quote
 
 from .urls import SEARCH_ENDPOINT, to_url
@@ -61,46 +63,13 @@ def _hue(text: str) -> int:
     return sum(ord(c) * 7 for c in str(text)) % 360
 
 
-def render(query: str, data: dict, settings: dict | None = None) -> str:
-    results = [r for r in (data or {}).get("results", []) if isinstance(r, dict)][:10]
-    related = [r for r in (data or {}).get("related", []) if isinstance(r, str)][:8]
-    answer = (data or {}).get("answer") or ""
+def open_page(query: str) -> str:
+    """The search engine itself: everything that is known before the model answers.
 
-    blocks: list[str] = []
-    for item in results:
-        url = to_url(str(item.get("url") or item.get("site") or ""))
-        site = _esc(item.get("site") or _domain(url))
-        title = _esc(item.get("title") or url)
-        snippet = _esc(item.get("snippet") or "")
-        playable = str(item.get("kind", "")).lower() in ("app", "game", "tool", "toy")
-        badge = '<span class="badge">▶ playable</span>' if playable else ""
-        blocks.append(
-            f'<div class="result">'
-            f'<div class="site"><span class="dot" style="background:hsl({_hue(site)} 55% 62%)"></span>'
-            f"<span>{site}</span></div>"
-            f'<div class="url">{_esc(url)}</div>'
-            f'<a class="title" href="{_esc(url)}">{title}</a>{badge}'
-            f"<p>{snippet}</p>"
-            f"</div>"
-        )
-
-    if not blocks:
-        blocks.append(
-            '<div class="result"><p>No results came back for that. Try a different wording, '
-            "or type a domain straight into the address bar.</p></div>"
-        )
-
-    related_html = ""
-    if related:
-        items = "".join(
-            f'<li><a href="{SEARCH_ENDPOINT}?q={quote(term, safe="")}">{_esc(term)}</a></li>' for term in related
-        )
-        related_html = f'<div class="related"><h3>Related searches</h3><ul>{items}</ul></div>'
-
-    answer_html = ""
-    if answer:
-        answer_html = f'<div class="answer"><h2>Summary</h2><p>{_esc(answer)}</p></div>'
-
+    Goes out before a token has been generated, so the tab shows Mirage with the
+    query in the box rather than nothing at all. ResultStream fills in the rest
+    below it, one result at a time.
+    """
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -121,19 +90,211 @@ def render(query: str, data: dict, settings: dict | None = None) -> str:
 </header>
 <main>
   <div class="count">About {_fake_count(query)} results</div>
-  {answer_html}
-  {''.join(blocks)}
-  {related_html}
-</main>
-<footer>Mirage indexes {_fake_count(query, pages=True)} pages that did not exist a moment ago.</footer>
-</body>
-</html>"""
+"""
+
+
+def close_page(query: str) -> str:
+    return (
+        f"</main>\n<footer>Mirage indexes {_fake_count(query, pages=True)} pages that did not "
+        "exist a moment ago.</footer>\n</body>\n</html>"
+    )
+
+
+def render(query: str, data: dict, settings: dict | None = None) -> str:
+    return open_page(query) + results_block(query, data) + close_page(query)
+
+
+NOTHING_FOUND = (
+    '<div class="result"><p>No results came back for that. Try a different wording, '
+    "or type a domain straight into the address bar.</p></div>"
+)
+
+
+def answer_html(answer: str) -> str:
+    return f'<div class="answer"><h2>Summary</h2><p>{_esc(answer)}</p></div>' if answer else ""
+
+
+def result_html(item: dict) -> str:
+    """One result. Rendered alone so it can go on screen the moment it exists."""
+    url = to_url(str(item.get("url") or item.get("site") or ""))
+    site = _esc(item.get("site") or _domain(url))
+    title = _esc(item.get("title") or url)
+    snippet = _esc(item.get("snippet") or "")
+    playable = str(item.get("kind", "")).lower() in ("app", "game", "tool", "toy")
+    badge = '<span class="badge">▶ playable</span>' if playable else ""
+    return (
+        f'<div class="result">'
+        f'<div class="site"><span class="dot" style="background:hsl({_hue(site)} 55% 62%)"></span>'
+        f"<span>{site}</span></div>"
+        f'<div class="url">{_esc(url)}</div>'
+        f'<a class="title" href="{_esc(url)}">{title}</a>{badge}'
+        f"<p>{snippet}</p>"
+        f"</div>"
+    )
+
+
+_RELATED_SHAPES = ("{} history", "{} online", "{} explained", "best {}", "{} archive", "{} forum")
+
+
+def related_terms(query: str) -> list[str]:
+    """The related-searches strip, built here rather than generated.
+
+    It used to be the last field in the search schema, which put ~50 tokens of
+    three-word phrases between the final result and the page being finished --
+    the one stretch where the reader is doing nothing but waiting. They are
+    formulaic by nature, so nothing is lost by stamping them out.
+    """
+    word = (query or "").strip()
+    return [shape.format(word) for shape in _RELATED_SHAPES] if word else []
+
+
+def related_html(related) -> str:
+    terms = [r for r in (related or []) if isinstance(r, str)][:8]
+    if not terms:
+        return ""
+    items = "".join(
+        f'<li><a href="{SEARCH_ENDPOINT}?q={quote(term, safe="")}">{_esc(term)}</a></li>' for term in terms
+    )
+    return f'<div class="related"><h3>Related searches</h3><ul>{items}</ul></div>'
+
+
+def results_block(query: str, data: dict) -> str:
+    """The whole results section at once -- for data that arrived complete."""
+    results = [r for r in (data or {}).get("results", []) if isinstance(r, dict)][:10]
+    blocks = [result_html(item) for item in results] or [NOTHING_FOUND]
+    return (
+        f"  {answer_html((data or {}).get('answer') or '')}\n"
+        f"  {''.join(blocks)}\n"
+        f"  {related_html((data or {}).get('related'))}\n"
+    )
+
+
+# ------------------------------------------------------- results, as they arrive
+
+# The answer lands before the results do -- it is first in the schema, and the
+# grammar keeps that order -- so it can be drawn from a partial document as soon
+# as its closing quote arrives.
+_ANSWER_RE = re.compile(r'"answer"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+
+def _unescape(raw: str) -> str:
+    try:
+        return json.loads(f'"{raw}"')
+    except json.JSONDecodeError:
+        return raw
+
+
+class ResultStream:
+    """Draws the results page from the model's JSON while it is still being written.
+
+    Search used to be the one call nobody could watch: `chat_json` collected the
+    whole document before a line of it could render, so a query sat on an empty
+    search engine for the length of the generation -- twenty seconds at Normal
+    effort, all of it after the point where the first result was already decided.
+
+    But a result is finished the moment its closing brace lands. The schema is a
+    flat object of flat objects, so finding that brace needs a depth counter that
+    knows what a string is, not a parser. Each object is handed to json.loads on
+    its own, and anything that doesn't survive that is dropped rather than
+    allowed to take the rest of the page down with it.
+
+    push() returns the HTML for whatever finished inside that chunk; close()
+    returns the tail -- related searches, or the note that nothing came back.
+    """
+
+    def __init__(self, limit: int = 10, query: str = "") -> None:
+        self._limit = limit
+        self._query = query
+        self._buf = ""
+        self._i = 0  # how far into _buf the object scanner has read
+        self._armed = False  # the results array has opened
+        self._ended = False  # ...and closed again
+        self._start = -1  # where the object being read began
+        self._depth = 0
+        self._in_string = False
+        self._escape = False
+        self._answered = False
+        self.count = 0
+
+    def push(self, text: str) -> str:
+        self._buf += text
+        out: list[str] = []
+
+        if not self._armed:
+            if not self._answered:
+                match = _ANSWER_RE.search(self._buf)
+                if match:
+                    self._answered = True
+                    out.append(answer_html(_unescape(match.group(1))))
+            # `"results"` cannot appear before the key itself: the only thing
+            # written above it is the answer, and a quote inside that is escaped.
+            key = self._buf.find('"results"')
+            bracket = self._buf.find("[", key) if key != -1 else -1
+            if bracket == -1:
+                return "".join(out)
+            self._armed = True
+            self._i = bracket + 1
+
+        out.append(self._scan())
+        return "".join(out)
+
+    def _scan(self) -> str:
+        if self._ended:
+            return ""
+        out: list[str] = []
+        buf = self._buf
+        i = self._i
+        while i < len(buf):
+            ch = buf[i]
+            if self._in_string:
+                if self._escape:
+                    self._escape = False
+                elif ch == "\\":
+                    self._escape = True
+                elif ch == '"':
+                    self._in_string = False
+            elif ch == '"':
+                self._in_string = True
+            elif ch == "{":
+                if self._depth == 0:
+                    self._start = i
+                self._depth += 1
+            elif ch == "}":
+                self._depth = max(0, self._depth - 1)
+                if self._depth == 0 and self._start >= 0:
+                    html = self._finish(buf[self._start : i + 1])
+                    self._start = -1
+                    if html:
+                        out.append(html)
+            elif ch == "]" and self._depth == 0:
+                self._ended = True
+                i += 1
+                break
+            i += 1
+        self._i = i
+        return "".join(out)
+
+    def _finish(self, text: str) -> str:
+        """One object, complete. Anything unusable is dropped, not raised."""
+        if self.count >= self._limit:
+            return ""
+        try:
+            item = json.loads(text)
+        except json.JSONDecodeError:
+            return ""
+        if not isinstance(item, dict) or not item.get("title"):
+            return ""
+        self.count += 1
+        return result_html(item)
+
+    def close(self) -> str:
+        out = [] if self.count else [NOTHING_FOUND]
+        out.append(related_html(related_terms(self._query)))
+        return "".join(out)
 
 
 def fallback_data(query: str) -> dict:
     """Results built without the model, so a search never comes back empty."""
-    import re
-
     slug = re.sub(r"[^a-z0-9]+", "-", query.lower()).strip("-") or "index"
     word = (query or "it").strip()
     return {
@@ -175,7 +336,7 @@ def fallback_data(query: str) -> dict:
                 "kind": "page",
             },
         ],
-        "related": [f"{word} history", f"{word} online", f"{word} explained", f"best {word}", f"{word} archive", f"{word} forum"],
+        "related": related_terms(word),
     }
 
 
