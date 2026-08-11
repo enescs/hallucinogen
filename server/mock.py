@@ -1,6 +1,6 @@
 """A stand-in provider so the browser is usable before a model is wired up.
 
-Same interface as `ollama`, canned output. Run with OB_MOCK=1.
+Same interface as `ollama`, canned output. Run with HLG_MOCK=1.
 
 Nothing here is content the browser ships. Games, articles and search results
 are the model's to write at runtime; these strings only stand in for it while
@@ -206,7 +206,7 @@ Every link below is live: click one and the browser will ask the provider for th
 <p>Point the browser at a real Ollama in settings and this page becomes whatever
 <a href="/archive">the model</a> thinks %%DOMAIN%% publishes. Until then, try
 <a href="https://cabinet.arcade/play/">an arcade cabinet</a> to see the interactive path,
-or <a href="https://mirage.search/?q=something+to+play">search for something</a>.</p>
+or <a href="https://hallucinogen.search/?q=something+to+play">search for something</a>.</p>
 <p>Other places from here: <a href="/about">about this site</a>,
 <a href="/archive/2019">the 2019 archive</a>, <a href="https://loop.zone/">loop.zone</a>,
 <a href="https://forum.oldcircuits.net/">the forums</a>.</p>

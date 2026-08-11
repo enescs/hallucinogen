@@ -7,7 +7,7 @@
  * this is the half that can hand the click back to the browser.)
  */
 (function () {
-  var CFG = window.__OB__ || {};
+  var CFG = window.__HLG__ || {};
   var PAGE = CFG.url || 'https://example.com/';
   var ORIGIN = CFG.origin || '';
 
@@ -23,7 +23,7 @@
     var raw = String(href).trim();
     if (!raw || raw.charAt(0) === '#') return null;
     if (/^(javascript|mailto|tel|data|blob|file):/i.test(raw)) return null;
-    if (/^ob:/i.test(raw)) return raw;
+    if (/^hlg:/i.test(raw)) return raw;
     try {
       return new URL(raw, PAGE).href;
     } catch (e) {
@@ -33,8 +33,8 @@
 
   function follow(url, opts) {
     if (!url) return;
-    if (/^ob:/i.test(url)) {
-      post({ type: 'action', action: url.slice(3) });
+    if (/^hlg:/i.test(url)) {
+      post({ type: 'action', action: url.replace(/^hlg:/i, '') });
       return;
     }
     post({ type: 'navigate', url: url, newTab: !!(opts && opts.newTab), text: (opts && opts.text) || '' });
@@ -74,7 +74,7 @@
     var a = anchorFrom(e.target);
     if (!a) return;
     var url = resolve(a.getAttribute('href'));
-    if (url && !/^ob:/i.test(url)) {
+    if (url && !/^hlg:/i.test(url)) {
       post({ type: 'hover', url: url, text: (a.textContent || '').trim().slice(0, 120) });
     }
   }, true);
@@ -138,6 +138,117 @@
     img.src = ORIGIN + '/api/img?w=' + w + '&h=' + h + '&alt=' + encodeURIComponent(alt.slice(0, 180));
   }
 
+  /* ----------------------------------------------------------------- sound */
+  //
+  // The same bargain as images: the model names a sound, and it gets built here
+  // rather than fetched. `new Audio('/sounds/coin.wav')` is a coin -- a short
+  // bright arpeggio -- because the filename says coin, and the same filename is
+  // always the same sound.
+  //
+  // Oscillators, not files. WebAudio generates samples inside the page, so it
+  // never asks the network for anything and the document's own `default-src
+  // 'none'` has nothing to block. A <audio src> would have been refused; this
+  // is the half of the illusion that can actually make a noise.
+
+  var AC = null;
+  function audio() {
+    var Ctor = window.AudioContext || window.webkitAudioContext;
+    if (!AC && Ctor) { try { AC = new Ctor(); } catch (e) { return null; } }
+    // Autoplay policy: a context created before the first gesture starts
+    // suspended, and a game that beeps on load would stay silent forever.
+    if (AC && AC.state === 'suspended') { try { AC.resume(); } catch (e) {} }
+    return AC;
+  }
+
+  function soundName(src) {
+    return decodeURIComponent(String(src || '').split('?')[0].split('/').pop() || '')
+      .replace(/\.[a-z0-9]+$/i, '')
+      .replace(/[-_+]+/g, ' ')
+      .toLowerCase();
+  }
+
+  function hash(text) {
+    var h = 0;
+    for (var i = 0; i < text.length; i++) h = (h * 31 + text.charCodeAt(i)) >>> 0;
+    return h;
+  }
+
+  // [match, waveform, semitones from the root, seconds per step, decay]
+  // Rising intervals read as reward, falling as loss -- which is most of what a
+  // game sound has to say.
+  var VOICES = [
+    [/coin|ring|pickup|collect|point|score|gem|star/, 'square', [0, 7, 12], 0.05, 0.11],
+    [/jump|hop|boing|spring|launch|fly/, 'sine', [0, 12], 0.07, 0.15],
+    [/level|win|complete|power|bonus|unlock|success/, 'square', [0, 4, 7, 12], 0.07, 0.17],
+    [/hit|hurt|damage|crash|explo|bump|break/, 'sawtooth', [0, -5, -12], 0.06, 0.17],
+    [/over|lose|lost|fail|die|death|defeat/, 'triangle', [0, -3, -7, -12], 0.11, 0.28],
+    [/click|tick|beep|blip|select|menu|type|key/, 'square', [0], 0.03, 0.04],
+  ];
+
+  function voiceFor(name) {
+    for (var i = 0; i < VOICES.length; i++) if (VOICES[i][0].test(name)) return VOICES[i];
+    return [null, 'sine', [0, 5], 0.06, 0.12];  // unnamed: still a sound, just a plain one
+  }
+
+  function beep(name) {
+    var ac = audio();
+    if (!ac) return;
+    var voice = voiceFor(name);
+    var wave = voice[1], steps = voice[2], gap = voice[3], decay = voice[4];
+    // Pitch from the name, so two different coins are two different coins --
+    // and the same one never drifts. Kept inside an octave of A4.
+    var root = 220 * Math.pow(2, (hash(name) % 12) / 12);
+    var start = ac.currentTime;
+
+    for (var i = 0; i < steps.length; i++) {
+      var at = start + i * gap;
+      var osc = ac.createOscillator();
+      var gain = ac.createGain();
+      osc.type = wave;
+      osc.frequency.setValueAtTime(root * Math.pow(2, steps[i] / 12), at);
+      gain.gain.setValueAtTime(0.0001, at);
+      gain.gain.exponentialRampToValueAtTime(0.18, at + 0.008);
+      gain.gain.exponentialRampToValueAtTime(0.0001, at + decay);
+      osc.connect(gain);
+      gain.connect(ac.destination);
+      osc.start(at);
+      osc.stop(at + decay + 0.02);
+    }
+  }
+
+  // Keep the URL, drop the fetch: the element stays a real media element so a
+  // game can read .currentTime or .loop without throwing, but nothing loads.
+  function silence(el) {
+    var src = el.getAttribute('src') || el.src || '';
+    if (src) {
+      el.setAttribute('data-ob-sound', src);
+      el.removeAttribute('src');
+      try { el.src = ''; } catch (e) {}
+    }
+  }
+
+  try {
+    var NativeAudio = window.Audio;
+    window.Audio = function (src) {
+      var el = document.createElement('audio');
+      if (src) el.setAttribute('data-ob-sound', src);
+      return el;
+    };
+    window.Audio.prototype = NativeAudio ? NativeAudio.prototype : {};
+  } catch (e) {}
+
+  try {
+    var Media = window.HTMLMediaElement;
+    if (Media && Media.prototype) {
+      Media.prototype.play = function () {
+        beep(soundName(this.getAttribute('data-ob-sound') || this.getAttribute('src') || ''));
+        return Promise.resolve();
+      };
+      Media.prototype.pause = function () {};
+      Media.prototype.load = function () {};
+    }
+  } catch (e) {}
+
   // Nothing can be embedded from outside, so give those boxes something to be.
   function defuse(el) {
     if (el.__ob) return;
@@ -162,6 +273,10 @@
 
     var sources = document.getElementsByTagName('source');
     while (sources.length) sources[0].parentNode.removeChild(sources[0]);
+
+    // <audio src> written into the page directly, rather than through Audio().
+    var media = document.querySelectorAll('audio, video');
+    for (var k = 0; k < media.length; k++) silence(media[k]);
 
     if (document.title && document.title !== window.__obTitle) {
       window.__obTitle = document.title;

@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from urllib.parse import quote, urlparse, urlunparse, parse_qs
 
-SEARCH_HOST = "mirage.search"
+SEARCH_HOST = "hallucinogen.search"
 SEARCH_PATH = "/search"
 SEARCH_ENDPOINT = f"https://{SEARCH_HOST}{SEARCH_PATH}"
 
@@ -22,7 +22,7 @@ def to_url(raw: str, base: str | None = None) -> str:
     text = (raw or "").strip()
     if not text:
         return search_url("")
-    if text.startswith("about:") or text.startswith("ob:"):
+    if text.startswith("about:") or text.startswith("hlg:"):
         return text
 
     # Relative hrefs only mean something next to the page they came from.

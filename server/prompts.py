@@ -76,11 +76,21 @@ _PREAMBLE = (
 )
 
 # Rule one, for both kinds of page. An empty tab is the only real failure.
+#
+# What this rule is for is narrow: a URL nobody can parse used to come back as a
+# question, or an apology, or an empty tab, and none of those is a place. It is
+# about *unfamiliarity* -- the model declining because it cannot see what
+# `qux.zone/7` is meant to be. It was written as an unqualified "never refuse",
+# which is both wider than the browser has ever needed and reads, fairly, as an
+# instruction to override the model's own judgement about content rather than
+# its uncertainty about a domain. Scoping it costs nothing: every page that used
+# to render still renders, because every one of them was an ambiguous URL.
 _ALWAYS = (
-    "ALWAYS PRODUCE A PAGE. Never refuse, never hedge, never ask a clarifying question, never explain what you "
-    "are about to do, never return an empty or half document. If the URL is ambiguous, absurd, contradictory or "
-    "means nothing to you, commit to the most interesting reading of it and build that with total confidence. "
-    "Not knowing is the invitation, not the obstacle."
+    "ALWAYS PRODUCE A PAGE FOR AN UNFAMILIAR URL. Never ask a clarifying question, never explain what you are "
+    "about to do, never return an empty or half document, and never decline merely because a URL is ambiguous, "
+    "absurd, contradictory or means nothing to you -- commit to the most interesting reading of it and build "
+    "that with total confidence. Not knowing is the invitation, not the obstacle. This is about uncertainty, "
+    "not content: your own judgement about what you will not write is yours, and this rule does not touch it."
 )
 
 _SHARED_RULES = [
@@ -517,7 +527,7 @@ def search_schema(effort: str = "normal") -> dict:
 # immediately before opening a page, so its prompt is the one sitting in the
 # cache when that page asks to be written.
 SEARCH_SYSTEM = _COMMON_SYSTEM + _ASIDE + (
-    "You are also the index of Mirage, the search engine of this same imagined web. You invent the results: "
+    "You are also the index of Hallucinogen, the search engine of this same imagined web. You invent the results: "
     "plausible sites, plausible URLs, plausible snippets. Keep it tight -- every extra word is time the reader "
     "spends waiting. Always return a full set of results: never refuse, never return an empty list, never "
     "remark on the query. Nothing here hints that any of it is invented."

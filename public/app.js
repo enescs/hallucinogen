@@ -198,7 +198,7 @@ function setTitle(tab, title) {
   const entry = entryOf(tab);
   if (entry) entry.title = tab.title;
   renderTabs();
-  if (tab.id === state.activeId) document.title = tab.title + ' — Offline Browser';
+  if (tab.id === state.activeId) document.title = tab.title + ' — Hallucinogen';
 }
 
 /* --------------------------------------------------------- chrome plumbing */
@@ -207,7 +207,7 @@ function displayUrl(url) {
   if (!url || url === NEW_TAB) return '';
   try {
     const u = new URL(url);
-    if (u.hostname === 'mirage.search') return u.searchParams.get('q') || url;
+    if (u.hostname === 'hallucinogen.search') return u.searchParams.get('q') || url;
   } catch (e) { /* not a url, show it raw */ }
   return url;
 }
@@ -224,7 +224,7 @@ function syncChrome() {
   $('bar').style.opacity = tab.loading ? '1' : '0';
   setStatus(tab.status);
   $('stats').textContent = tab.stats;
-  document.title = (tab.title || 'Offline Browser') + ' — Offline Browser';
+  document.title = (tab.title || 'Hallucinogen') + ' — Hallucinogen';
   // Apps used to hide behind this while the whole document was buffered. They
   // stream now -- only their <script> is held back -- so there is nothing to
   // hide, and watching the page assemble beats watching a progress panel.
@@ -261,7 +261,7 @@ function framePrefix(url) {
   return '<!doctype html><html><head><meta charset="utf-8">'
     + `<meta http-equiv="Content-Security-Policy" content="${csp}">`
     + `<base href="${origin}/">`
-    + `<script>window.__OB__=${JSON.stringify({ url, origin })};<\/script>`
+    + `<script>window.__HLG__=${JSON.stringify({ url, origin })};<\/script>`
     + `<script>${state.inject}<\/script>`;
 }
 
@@ -629,7 +629,7 @@ function showNewTab(tab, push) {
 }
 
 const SUGGESTIONS = [
-  ['mirage.search', 'the search engine of a web that is not there'],
+  ['hallucinogen.search', 'the search engine of a web that is not there'],
   ['cabinet.arcade/play/', 'something to play'],
   ['instagram.com', 'what the model thinks it looks like'],
   ['en.wikipedia.org/wiki/Antikythera_mechanism', 'an encyclopaedia entry'],
@@ -679,7 +679,7 @@ function startPageHtml() {
   </style></head><body>
     <h1>a web that isn't there</h1>
     <div class="tag">Every page you open from here is written on the spot. None of it exists.</div>
-    <form action="https://mirage.search/search" method="get">
+    <form action="https://hallucinogen.search/search" method="get">
       <input name="q" placeholder="Search for anything, real or not" autofocus autocomplete="off" spellcheck="false">
       <button type="submit">Search</button>
     </form>
@@ -692,7 +692,7 @@ function startPageHtml() {
 function errorHtml(err, url) {
   const hint = err.hint ? `<p class="hint">${esc(err.hint)}</p>` : '';
   const wizard = (err.code === 'OFFLINE' || err.code === 'MODEL_NOT_FOUND')
-    ? '<a class="btn" href="ob:setup">Open the setup wizard</a>' : '';
+    ? '<a class="btn" href="hlg:setup">Open the setup wizard</a>' : '';
   return `<!doctype html><html><head><meta charset="utf-8"><title>Nothing came back</title><style>
     :root { color-scheme: dark; }
     body { margin:0; min-height:100vh; background:#0a0b10; color:#d8dbe6; display:grid; place-items:center;
@@ -712,10 +712,10 @@ function errorHtml(err, url) {
     <p>${esc(err.message || 'The page could not be written.')}</p>
     ${hint}
     <div class="row">
-      <a class="btn" href="ob:retry">Try again</a>
+      <a class="btn" href="hlg:retry">Try again</a>
       ${wizard}
-      <a class="btn" href="ob:settings">Settings</a>
-      <a class="btn" href="ob:home">New tab</a>
+      <a class="btn" href="hlg:settings">Settings</a>
+      <a class="btn" href="hlg:home">New tab</a>
     </div>
   </div></body></html>`;
 }
@@ -1024,11 +1024,12 @@ function openSettings() {
   $('setThink').checked = !!s.think;
   $('setCache').checked = !!s.useCache;
   $('setPrefetch').checked = !!s.prefetch;
+  $('setArt').checked = !!s.art;
 
   fill($('setStyle'), state.meta.styles, s.style);
   fill($('setEffort'), state.meta.efforts, s.effort);
 
-  $('settingsNote').textContent = state.meta.mock ? 'Running the mock provider (OB_MOCK=1) — no model is involved.' : '';
+  $('settingsNote').textContent = state.meta.mock ? 'Running the mock provider (HLG_MOCK=1) — no model is involved.' : '';
   $('settingsModal').hidden = false;
   loadModels();
 }
@@ -1076,6 +1077,7 @@ async function saveSettings() {
     think: $('setThink').checked,
     useCache: $('setCache').checked,
     prefetch: $('setPrefetch').checked,
+    art: $('setArt').checked,
   };
   const data = await fetch('/api/settings', {
     method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(patch),

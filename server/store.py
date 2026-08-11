@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
 PAGES = DATA / "pages"
 SITES = DATA / "sites"
+ART = DATA / "art"
 SETTINGS_FILE = DATA / "settings.json"
 HISTORY_FILE = DATA / "history.json"
 BOOKMARKS_FILE = DATA / "bookmarks.json"
@@ -47,6 +48,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "think": False,  # reasoning first is a latency tax on every page
     "style": "modern",
     "useCache": True,
+    # Have the model draw the pictures instead of img.py. Off the critical path
+    # -- the procedural motif still answers immediately, and the drawing lands
+    # in the cache for next time.
+    "art": True,
 }
 
 NUMERIC_BOUNDS = {
@@ -66,6 +71,7 @@ _settings_cache: dict[str, Any] | None = None
 def ensure_dirs() -> None:
     PAGES.mkdir(parents=True, exist_ok=True)
     SITES.mkdir(parents=True, exist_ok=True)
+    ART.mkdir(parents=True, exist_ok=True)
 
 
 def _read_json(path: Path, fallback):
@@ -167,6 +173,34 @@ def put_page(url: str, title: str, html: str, model: str, mode: str = "page") ->
 
 def drop_page(url: str) -> None:
     (PAGES / f"{_key(url)}.json").unlink(missing_ok=True)
+
+
+# -------------------------------------------------------------------------- art
+# Keyed on the description alone, never on the size the <img> happened to ask
+# for: the drawing is written against a fixed viewBox and scales to whatever
+# box it lands in. So the same alt text anywhere on the imagined web -- the same
+# page revisited, the same photograph referenced by two different articles --
+# is the same picture, drawn once.
+
+
+def _art_key(alt: str) -> str:
+    return _key(" ".join((alt or "").lower().split()))
+
+
+def get_art(alt: str) -> str:
+    path = ART / f"{_art_key(alt)}.svg"
+    try:
+        return path.read_text("utf-8")
+    except Exception:
+        return ""
+
+
+def put_art(alt: str, svg: str) -> None:
+    path = ART / f"{_art_key(alt)}.svg"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".svg.tmp")
+    tmp.write_text(svg, "utf-8")
+    tmp.replace(path)
 
 
 # ------------------------------------------------------------------------ sites

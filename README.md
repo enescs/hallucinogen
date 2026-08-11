@@ -1,4 +1,4 @@
-# Offline Browser
+# Hallucinogen
 
 A browser for a web that does not exist.
 
@@ -33,7 +33,7 @@ the browser's own setup panel, which opens by itself when something is missing.
 Want to see the thing move before committing to a 5 GB download:
 
 ```bash
-OB_MOCK=1 .venv/bin/python run.py     # canned pages, no model involved
+HLG_MOCK=1 .venv/bin/python run.py     # canned pages, no model involved
 ```
 
 Doing it by hand instead:
@@ -66,7 +66,7 @@ The rest, roughly in order of how much they're felt:
 - **Effort** — one setting, from *Minimal* to *Full*, driving everything that
   costs tokens: page length, search result count, snippet length, and the
   ceiling for games. Turn it down and the whole browser gets faster at once.
-- **Search streams too.** Mirage goes on screen before a token is generated,
+- **Search streams too.** The search page goes on screen before a token is generated,
   with the query in the box — and then each result appears as it is written. The
   JSON used to have to be complete before any of it could render, which meant
   twenty seconds on an empty search engine at *Normal* effort, most of it after
@@ -294,6 +294,41 @@ are locked down harder than that: a strict CSP (`default-src 'none'`,
 submits are intercepted and handed back to the chrome as navigation, so a click
 inside an invented page can only ever produce another invented page.
 
+## What this is, and what it isn't
+
+It is a toy for one person on one machine. `run.py` binds `127.0.0.1` and there
+is no account, no session, no authentication and no multi-user anything, because
+nothing here was built on the assumption that a stranger could reach it.
+`run.py` refuses to start on an address other machines can reach, and wants
+`HLG_ALLOW_PUBLIC=1` before it will reconsider. Pointing this at a network turns
+a private hallucination into something you are publishing to other people, and
+every design decision above — no auth, no rate limit, no moderation, a model
+told to commit to whatever it is handed — was made for the other case. The
+variable exists so that doing it anyway is a decision rather than a typo.
+
+Nothing on a generated page is real, and that includes the parts that look most
+like they would be. Names, quotations, statistics, prices, dates, bylines and
+counts are invented, in the specific sense that the model was *instructed* to
+invent them rather than merely failing to look them up. A page about a real
+company, a real place or a real person is fabrication about a real subject, and
+if a screenshot of one leaves your machine, whatever it says is now something you
+said. Every document the browser writes carries a `<meta name="generator">`
+saying exactly that, because the page itself is forbidden to.
+
+Typing a domain you recognise gets you the model's impression of it, built from
+invented content. It is not that site, is not affiliated with it, and is not
+endorsed by whoever owns it. That gap is the entire point of the project and it
+stops being funny the moment anyone presents one of these as genuine.
+
+The browser does not try to remove the model's own judgement about what it will
+write. There is a rule near the top of `prompts.py` telling it never to bail out
+on a URL it cannot make sense of, and that rule is about *unfamiliarity* — a
+model that answers `qux.zone/7` with a clarifying question has left you looking
+at an empty tab, which is the one failure this thing cannot have. It is scoped to
+that and says so. What you point it at is a model you installed yourself, running
+on your own hardware; it arrives with whatever its publisher gave it, and that is
+between the two of you. Please use it somewhere legal.
+
 ## Settings
 
 | setting | what it does |
@@ -348,3 +383,12 @@ question, or answers with prose instead of a document, it gets one firm retry;
 if that fails too, `fallback.py` builds a plain page for the URL so the tab
 always has somewhere to be. Not knowing what a URL means is an invitation, not
 an error.
+
+## Licence
+
+Apache 2.0 — see [LICENSE](LICENSE). Do what you like with it, including
+commercially; keep the notice, and note that it comes with no warranty of any
+kind and its authors are not liable for what it writes.
+
+No model weights are shipped or bundled. Ollama and whatever model you pull
+carry their own licences, which are between you and their publishers.

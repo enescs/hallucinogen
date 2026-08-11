@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Setup wizard for the offline browser.
+"""Setup wizard for hallucinogen.
 
     python3 setup.py
 
@@ -138,7 +138,7 @@ def latest_ollama_version() -> str:
     try:
         request = urllib.request.Request(
             "https://api.github.com/repos/ollama/ollama/releases/latest",
-            headers={"accept": "application/vnd.github+json", "user-agent": "offline-browser-setup"},
+            headers={"accept": "application/vnd.github+json", "user-agent": "hallucinogen-setup"},
         )
         with urllib.request.urlopen(request, timeout=6) as response:
             return str(json.loads(response.read().decode()).get("tag_name", "")).lstrip("v")
@@ -321,7 +321,7 @@ def write_settings(model: str) -> None:
 
 
 def main() -> int:
-    say(f"{BOLD}offline browser — setup{RESET}")
+    say(f"{BOLD}hallucinogen — setup{RESET}")
     say(f"{DIM}a browser for a web that does not exist; every page comes out of a local model{RESET}")
 
     if not ensure_venv():
@@ -329,7 +329,7 @@ def main() -> int:
 
     if not ensure_ollama():
         say(f"\n{YELLOW}Ollama isn't ready.{RESET} You can still try the browser with canned pages:")
-        say(f"  {BOLD}OB_MOCK=1 {venv_python()} run.py{RESET}")
+        say(f"  {BOLD}HLG_MOCK=1 {venv_python()} run.py{RESET}")
         return 1
 
     model = ensure_model()

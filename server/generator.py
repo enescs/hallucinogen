@@ -42,7 +42,7 @@ BAIL_AFTER_CHARS = 200  # enough to tell a document from a sentence about one
 
 def provider(settings: dict):
     """The only place the backend is chosen."""
-    if os.environ.get("OB_MOCK") == "1":
+    if os.environ.get("HLG_MOCK") == "1":
         return mock
     return ollama
 

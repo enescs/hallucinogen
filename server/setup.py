@@ -22,6 +22,13 @@ from . import ollama, store
 from .models import TIERS, fits, recommend as recommend_model
 
 INSTALL_URL = "https://ollama.com/install.sh"
+DOWNLOAD_URL = "https://ollama.com/download"
+
+# What to tell someone who has to install it themselves. There is no unattended
+# path on Windows -- the install script is sh, so it's the installer or nothing.
+INSTALL_HINT = (
+    f"download the installer from {DOWNLOAD_URL}" if os.name == "nt" else f"curl -fsSL {INSTALL_URL} | sh"
+)
 
 
 def which_ollama() -> str:
@@ -93,8 +100,17 @@ def recommend(vram_gb: float) -> dict:
     return {**recommend_model(vram_gb), "vramGb": vram_gb}
 
 
+def _is_root() -> bool:
+    """os.geteuid only exists on POSIX; on Windows there's no equivalent to check."""
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
 def can_install_unattended() -> bool:
-    if os.geteuid() == 0:
+    # The installer is a shell script and the tuning is a systemd drop-in, so
+    # neither has anything to do on Windows.
+    if os.name == "nt":
+        return False
+    if _is_root():
         return True
     if not shutil.which("sudo"):
         return False
@@ -133,7 +149,7 @@ async def status() -> dict:
         "gpu": health.get("gpu", {}),
         "tuning": tuning_status(),
         "canInstall": can_install_unattended(),
-        "installCommand": f"curl -fsSL {INSTALL_URL} | sh",
+        "installCommand": INSTALL_HINT,
         "tiers": [{**tier, "fits": tier in fits(vram)} for tier in reversed(TIERS)],
     }
 
@@ -166,7 +182,7 @@ TUNING = {
 
 UNIT = "ollama"
 OVERRIDE_DIR = "/etc/systemd/system/ollama.service.d"
-OVERRIDE_FILE = f"{OVERRIDE_DIR}/10-offline-browser.conf"
+OVERRIDE_FILE = f"{OVERRIDE_DIR}/10-hallucinogen.conf"
 
 _OVERRIDE_BODY = "[Service]\n" + "".join(f'Environment="{k}={v}"\n' for k, v in TUNING.items())
 
@@ -244,7 +260,7 @@ async def tune_daemon() -> AsyncIterator[dict]:
         }
         return
 
-    prefix = "" if os.geteuid() == 0 else "sudo -n "
+    prefix = "" if _is_root() else "sudo -n "
     yield {"type": "log", "text": f"writing {OVERRIDE_FILE}"}
 
     # Piped through tee because only the write needs to be elevated. shlex.quote
@@ -314,11 +330,11 @@ async def install_ollama(version: str = "") -> AsyncIterator[dict]:
         yield {
             "type": "error",
             "message": "Installing Ollama needs administrator rights, which this page can't ask for.",
-            "hint": f"Run this in a terminal instead:  curl -fsSL {INSTALL_URL} | sh",
+            "hint": f"Do it yourself instead:  {INSTALL_HINT}",
         }
         return
 
-    prefix = "" if os.geteuid() == 0 else "sudo -n "
+    prefix = "" if _is_root() else "sudo -n "
     pin = f"OLLAMA_VERSION={version} " if version else ""
 
     expected = version or await latest_version()

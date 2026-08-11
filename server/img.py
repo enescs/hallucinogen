@@ -16,6 +16,10 @@ _CHART = ("chart", "graph", "plot", "statistic", "diagram", "data", "figure", "r
 _MAP = ("map", "aerial", "satellite", "floor plan", "floorplan", "route", "terrain", "region")
 _LOGO = ("logo", "icon", "badge", "emblem", "crest", "mark", "sticker")
 _UI = ("screenshot", "interface", "dashboard", "app ", "ui ", "window", "console", "terminal")
+# Games ask for characters far more than they ask for scenery, and a mountain
+# range is a poor stand-in for a sprite. Checked before _PORTRAIT, which would
+# otherwise claim "player" and hand back a headshot.
+_SPRITE = ("sprite", "pixel", "8-bit", "16-bit", "character", "avatar", "mascot", "enemy", "monster", "arcade")
 
 
 def _rng(seed: int):
@@ -48,7 +52,9 @@ def svg_for(alt: str, width, height) -> str:
     hue2 = (hue + 35 + int(rand() * 90)) % 360
 
     lowered = alt.lower()
-    if any(word in lowered for word in _LOGO):
+    if any(word in lowered for word in _SPRITE):
+        motif = _sprite(w, h, rand)
+    elif any(word in lowered for word in _LOGO):
         motif = _logo(alt, w, h, hue, rand)
     elif any(word in lowered for word in _CHART):
         motif = _chart(w, h, rand)
@@ -110,6 +116,34 @@ def _scene(w: int, h: int, rand) -> str:
         + f'<path d="M -10 {h} L -10 {horizon:.0f} {" ".join(peaks)} L {w + 10} {h} Z" fill="#000" opacity="0.22"/>'
         + f'<rect y="{horizon:.0f}" width="{w}" height="{h - horizon:.0f}" fill="#000" opacity="0.12"/>'
     )
+
+
+def _sprite(w: int, h: int, rand) -> str:
+    """A figure on a pixel grid, mirrored down the middle.
+
+    Symmetry is what makes a random scatter of blocks read as a creature rather
+    than as noise -- it is the whole trick behind every 8-bit invader. Only the
+    left half is decided; the right is its reflection.
+    """
+    cols, rows = 5, 6  # half-width, mirrored to ten blocks across
+    cell = min(w / 13.0, h / 8.5)
+    ox = w / 2 - cols * cell
+    oy = h / 2 - rows * cell * 0.62
+
+    blocks = []
+    for row in range(rows):
+        for col in range(cols):
+            # Denser towards the spine and the middle rows, so the figure has a
+            # body rather than four scattered corners.
+            density = 0.78 - 0.1 * col - (0.28 if row in (0, rows - 1) else 0)
+            if rand() > density:
+                continue
+            for x in (ox + col * cell, ox + (2 * cols - 1 - col) * cell):
+                blocks.append(
+                    f'<rect x="{x:.0f}" y="{oy + row * cell:.0f}" width="{cell + 0.5:.0f}" '
+                    f'height="{cell + 0.5:.0f}" fill="#fff" opacity="0.92"/>'
+                )
+    return "".join(blocks)
 
 
 def _portrait(w: int, h: int) -> str:

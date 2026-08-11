@@ -1,4 +1,4 @@
-"""Mirage, the search engine.
+"""Hallucinogen, the search engine.
 
 The model invents the *results*; the page around them is rendered here so the
 search engine looks like itself on every query instead of being redesigned each
@@ -12,6 +12,7 @@ import json
 import re
 from urllib.parse import quote
 
+from .theme import GENERATOR_META
 from .urls import SEARCH_ENDPOINT, to_url
 
 _STYLE = """
@@ -66,8 +67,8 @@ def _hue(text: str) -> int:
 def open_page(query: str) -> str:
     """The search engine itself: everything that is known before the model answers.
 
-    Goes out before a token has been generated, so the tab shows Mirage with the
-    query in the box rather than nothing at all. ResultStream fills in the rest
+    Goes out before a token has been generated, so the tab shows the search page
+    with the query in the box rather than nothing at all. ResultStream fills in the rest
     below it, one result at a time.
     """
     return f"""<!doctype html>
@@ -75,13 +76,14 @@ def open_page(query: str) -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{_esc(query)} — Mirage</title>
+{GENERATOR_META}
+<title>{_esc(query)} — Hallucinogen</title>
 <style>{_STYLE}</style>
 </head>
 <body>
 <header>
   <div class="bar">
-    <a class="logo" href="https://mirage.search/">mirage</a>
+    <a class="logo" href="https://hallucinogen.search/">hallucinogen</a>
     <form action="{SEARCH_ENDPOINT}" method="get">
       <input name="q" value="{_esc(query)}" autocomplete="off" spellcheck="false">
       <button type="submit">Search</button>
@@ -95,7 +97,7 @@ def open_page(query: str) -> str:
 
 def close_page(query: str) -> str:
     return (
-        f"</main>\n<footer>Mirage indexes {_fake_count(query, pages=True)} pages that did not "
+        f"</main>\n<footer>Hallucinogen indexes {_fake_count(query, pages=True)} pages that did not "
         "exist a moment ago.</footer>\n</body>\n</html>"
     )
 
@@ -316,8 +318,8 @@ def fallback_data(query: str) -> dict:
             },
             {
                 "title": f"{word.title()} — the archive",
-                "url": f"https://archive.mirage.dev/{slug}",
-                "site": "archive.mirage.dev",
+                "url": f"https://archive.hallucinogen.dev/{slug}",
+                "site": "archive.hallucinogen.dev",
                 "snippet": f"Everything filed under {word}: clippings, scans, and a timeline that goes back further than expected.",
                 "kind": "page",
             },

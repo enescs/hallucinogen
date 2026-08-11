@@ -12,7 +12,7 @@ from fastapi import Body, FastAPI, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import __version__, ollama, prefetch, prompts, setup as setup_mod, store
+from . import __version__, art, ollama, prefetch, prompts, setup as setup_mod, store
 from .generator import provider, stream_page
 from .img import svg_for
 from .prompts import EFFORT_PRESETS, STYLE_PRESETS
@@ -30,9 +30,41 @@ async def _warm_in_background():
         pass  # no model yet is a normal state; the wizard handles it
 
 
+def _quieten_reader_disconnects(loop: asyncio.AbstractEventLoop) -> None:
+    """Stop Windows logging a traceback every time a reader navigates away.
+
+    Every page is an SSE stream held open for as long as it takes to write, and
+    closing the tab or hitting stop aborts one. The proactor transport then
+    shuts down a socket the client has already torn down, gets WinError 10054
+    back, and asyncio prints the whole traceback -- for the single most ordinary
+    thing anyone does in this browser. There is nothing to recover from: the
+    reader is gone, which is what the code below already assumes.
+
+    A filter, not a silencer: only this one exception from this one transport is
+    dropped, and everything else reaches the handler that was there before.
+    (Switching to the selector loop would also fix it, and would break the setup
+    wizard -- create_subprocess_exec needs the proactor on Windows.)
+    """
+    previous = loop.get_exception_handler()
+
+    def handler(active_loop, context):
+        error = context.get("exception")
+        origin = f"{context.get('message', '')} {context.get('transport', '')}"
+        if isinstance(error, ConnectionResetError) and "_call_connection_lost" in origin:
+            return
+        if previous is None:
+            active_loop.default_exception_handler(context)
+        else:
+            previous(active_loop, context)
+
+    loop.set_exception_handler(handler)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     store.ensure_dirs()
+    if os.name == "nt":
+        _quieten_reader_disconnects(asyncio.get_running_loop())
     task = asyncio.create_task(_warm_in_background())
     yield
     task.cancel()
@@ -60,7 +92,7 @@ def _sse(events) -> StreamingResponse:
     )
 
 
-app = FastAPI(title="Offline Browser", version=__version__, lifespan=lifespan)
+app = FastAPI(title="Hallucinogen", version=__version__, lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=PUBLIC), name="static")
 
 
@@ -120,11 +152,28 @@ async def api_prefetch_site(domain: str = Query(..., description="a domain being
 
 @app.get("/api/img")
 async def api_img(alt: str = "", w: int = 800, h: int = 450):
-    """Artwork for <img alt="..."> that the model left without a src."""
+    """Artwork for <img alt="..."> that the model left without a src.
+
+    A drawing if one has been made for this description, and a procedural motif
+    if not -- plus a request for one, so that the second time this picture is
+    called for it is the real thing. The reader never waits for either.
+    """
+    settings = store.get_settings()
+    drawn = store.get_art(alt) if settings.get("art", True) else ""
+    if drawn:
+        return Response(
+            drawn,
+            media_type="image/svg+xml",
+            headers={"Cache-Control": "public, max-age=604800", "X-Ob-Art": "drawn"},
+        )
+
+    art.schedule(alt, settings)
     return Response(
         svg_for(alt, w, h),
         media_type="image/svg+xml",
-        headers={"Cache-Control": "public, max-age=604800"},
+        # Briefly, unlike a drawing: this one is a stand-in that expects to be
+        # replaced, and a week in the browser cache would outlive its usefulness.
+        headers={"Cache-Control": "public, max-age=60", "X-Ob-Art": "motif"},
     )
 
 
@@ -199,7 +248,7 @@ async def api_get_settings():
             for key, value in EFFORT_PRESETS.items()
         ],
         "provider": provider(settings).PROVIDER,
-        "mock": os.environ.get("OB_MOCK") == "1",
+        "mock": os.environ.get("HLG_MOCK") == "1",
     }
 
 

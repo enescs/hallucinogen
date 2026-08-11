@@ -400,11 +400,24 @@ CLOSE = "\n</body></html>"
 _FOOTER_EXTRAS = (("About", "/about"), ("Archive", "/archive"), ("Contact", "/contact"))
 
 
+# Every document this browser produces carries it, so a page that gets saved to
+# disk, screenshotted or pasted somewhere still says what it is once it is away
+# from the chrome that made the point obvious. It sits in the furniture rather
+# than the prompt on purpose: the model is told to stay in character and never
+# break the fiction, and this has to be true whether it obeys that or not.
+# Server-built, so it costs no tokens and cannot drift.
+GENERATOR_META = (
+    '<meta name="generator" content="Hallucinogen — every word, name, figure and quotation on this page was '
+    'invented by a language model. Nothing here was retrieved from anywhere and none of it is factual.">'
+)
+
+
 def open_document(title: str, era: str, palette: dict) -> str:
     """Doctype through the opening <body>. Everything after it is the model's."""
     return (
         '<!doctype html>\n<html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        f"{GENERATOR_META}"
         f"<title>{_esc(title)}</title>\n"
         f"<style>{stylesheet(era, palette)}</style></head>\n<body>\n"
     )
