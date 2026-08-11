@@ -41,6 +41,9 @@ node_modules/
 .vscode/
 *.swp
 
+# Claude Code — personal, machine-local (the skill and .mcp.json are project files)
+.claude/settings.local.json
+
 # OS
 .DS_Store
 Thumbs.db

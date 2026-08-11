@@ -12,10 +12,11 @@ from fastapi import Body, FastAPI, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import __version__, art, ollama, prefetch, prompts, setup as setup_mod, store
+from . import __version__, art, broker, ollama, prefetch, prompts, setup as setup_mod, store
 from .generator import provider, stream_page
 from .img import svg_for
 from .prompts import EFFORT_PRESETS, STYLE_PRESETS
+from .urls import to_url
 
 PUBLIC = Path(__file__).resolve().parent.parent / "public"
 
@@ -199,6 +200,95 @@ async def api_models():
 async def api_warmup():
     settings = store.get_settings()
     return await provider(settings).warmup(settings, prime=prompts.cache_prefix())
+
+
+# ----------------------------------------------------------- the other backend
+# When the model is Claude rather than a daemon on localhost, generation runs
+# backwards: the server can't call anything, so it parks the request in broker.py
+# and an MCP client comes and takes it. These five routes are that client's whole
+# surface -- everything else about a page is identical either way.
+
+
+@app.post("/api/llm/attach")
+async def api_llm_attach():
+    """A worker saying it exists. Until one does, a page waits seconds, not minutes."""
+    broker.attach()
+    return {"ok": True, "provider": provider(store.get_settings()).PROVIDER, **broker.snapshot()}
+
+
+@app.post("/api/llm/detach")
+async def api_llm_detach():
+    broker.detach()
+    return {"ok": True}
+
+
+@app.get("/api/llm/next")
+async def api_llm_next(wait: float = Query(25.0, description="seconds to hold the request open")):
+    """Long-poll for something to write. Holds open so an idle browser is quiet."""
+    job = await broker.wait_for_job(min(max(wait, 0.0), 120.0))
+    return {"idle": True} if job is None else {"request": job.payload()}
+
+
+@app.post("/api/llm/respond")
+async def api_llm_respond(body: dict = Body(default={})):
+    """The answer to one request: HTML for a page, JSON for a profile or a search."""
+    request_id = str(body.get("id") or "").strip()
+    content = body.get("content")
+    if not request_id or not isinstance(content, str):
+        return JSONResponse({"ok": False, "reason": "id and content are both required"}, status_code=400)
+    return broker.deliver(request_id, content)
+
+
+@app.post("/api/llm/fail")
+async def api_llm_fail(body: dict = Body(default={})):
+    return broker.fail(str(body.get("id") or "").strip(), str(body.get("message") or ""))
+
+
+@app.post("/api/llm/requeue")
+async def api_llm_requeue(body: dict = Body(default={})):
+    """Give a request back unanswered but unharmed — for a hand-over that fell through."""
+    return broker.requeue(str(body.get("id") or "").strip())
+
+
+@app.get("/api/llm/status")
+async def api_llm_status():
+    settings = store.get_settings()
+    return {
+        "provider": provider(settings).PROVIDER,
+        "style": settings.get("style"),
+        "effort": settings.get("effort"),
+        **broker.snapshot(),
+    }
+
+
+@app.post("/api/llm/visit")
+async def api_llm_visit(
+    q: str = Query(..., description="a URL to write, whether or not anybody is looking at it"),
+    referrer: str = Query("", alias="from"),
+):
+    """Commission a page from outside the browser.
+
+    Returns as soon as the job starts, never when it finishes -- the caller is
+    usually the same worker that has to answer the requests this creates, and
+    waiting here for its own answer would deadlock. Poll /api/llm/next next.
+    """
+    return prefetch.render(q, referrer)
+
+
+@app.get("/api/llm/page")
+async def api_llm_page(url: str = Query(...), html: bool = False):
+    """What a URL ended up as. How a worker checks on a page it commissioned."""
+    record = await asyncio.to_thread(store.get_page, to_url(url))
+    if not record:
+        return {"found": False, "url": url}
+    return {
+        "found": True,
+        "url": record.get("url"),
+        "title": record.get("title"),
+        "mode": record.get("mode"),
+        "chars": len(record.get("html") or ""),
+        **({"html": record.get("html")} if html else {}),
+    }
 
 
 # ------------------------------------------------------------------ setup wizard

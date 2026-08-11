@@ -1,10 +1,11 @@
 #!/usr/bin/env python
 """Start the browser.
 
-    .venv/bin/python run.py            # talk to Ollama
-    HLG_MOCK=1 .venv/bin/python run.py  # canned pages, no model needed
+    .venv/bin/python run.py                   # talk to Ollama
+    HLG_MOCK=1 .venv/bin/python run.py        # canned pages, no model needed
+    HLG_LLM=claude .venv/bin/python run.py    # Claude writes them, over MCP
 
-Environment: PORT, HLG_HOST, HLG_ALLOW_PUBLIC, HLG_RELOAD, HLG_MOCK
+Environment: PORT, HLG_HOST, HLG_ALLOW_PUBLIC, HLG_RELOAD, HLG_MOCK, HLG_LLM
 """
 
 import ipaddress
@@ -55,11 +56,20 @@ def _refuse_public_bind(host: str) -> None:
     raise SystemExit(1)
 
 
+_PROVIDERS = {
+    "ollama": "ollama",
+    "mock": "mock (no model)",
+    "claude": "claude (waiting for an MCP client to write the pages)",
+}
+
 if __name__ == "__main__":
     ensure_dirs()
     host = os.environ.get("HLG_HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", "8765"))
-    provider = "mock (no model)" if os.environ.get("HLG_MOCK") == "1" else "ollama"
+    backend = os.environ.get("HLG_LLM", "").strip().lower()
+    if not backend:
+        backend = "mock" if os.environ.get("HLG_MOCK") == "1" else "ollama"
+    provider = _PROVIDERS.get(backend, backend)
 
     public = not _is_loopback(host)
     if public and os.environ.get(PUBLIC_BIND_OPT_IN) != "1":
