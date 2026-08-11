@@ -1,3 +1,7 @@
 fastapi>=0.115
 uvicorn[standard]>=0.30
 httpx>=0.27
+# Only for mcp_server.py, which is how Claude drives the browser and, with
+# OB_LLM=claude, becomes the model writing its pages. The browser itself runs
+# without it.
+mcp>=2.0

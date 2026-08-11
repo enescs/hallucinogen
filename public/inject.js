@@ -153,6 +153,10 @@
     if (el.parentNode) el.parentNode.replaceChild(box, el);
   }
 
+  /* Per document, not per frame: this whole file re-runs on every doc.open(),
+     so a closure is the one scope that resets when the page does. */
+  var adopted = false, seenTitle = '';
+
   function sweep() {
     var imgs = document.getElementsByTagName('img');
     for (var i = 0; i < imgs.length; i++) paint(imgs[i]);
@@ -163,9 +167,20 @@
     var sources = document.getElementsByTagName('source');
     while (sources.length) sources[0].parentNode.removeChild(sources[0]);
 
-    if (document.title && document.title !== window.__obTitle) {
-      window.__obTitle = document.title;
-      post({ type: 'title', title: document.title });
+    /* The first <title> to appear is the shell's, written by the server before
+       the page existed and built out of the URL because that is all there was.
+       The tab is named from the page's own <h1> instead, on the `done` event --
+       so relaying this one back is not news, it is a race against that event,
+       and the faster the pages arrive the more often it wins. Adopt the first
+       one silently; report only a title a page's own script sets afterwards. */
+    if (document.title) {
+      if (!adopted) {
+        adopted = true;
+        seenTitle = document.title;
+      } else if (document.title !== seenTitle) {
+        seenTitle = document.title;
+        post({ type: 'title', title: document.title });
+      }
     }
   }
 

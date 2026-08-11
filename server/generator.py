@@ -31,7 +31,7 @@ import re
 import time
 from typing import Any, AsyncIterator
 
-from . import fallback, mock, ollama, prefetch, prompts, serp, store, theme
+from . import claude, fallback, mock, ollama, prefetch, prompts, serp, store, theme
 from .stream_filters import _MAIN_RE, HtmlCleaner, close_fragment, extract_heading, extract_title
 from .urls import SEARCH_ENDPOINT, domain_of, guess_site_name, is_search, path_of, query_of, to_url
 
@@ -41,10 +41,28 @@ BAIL_AFTER_CHARS = 200  # enough to tell a document from a sentence about one
 
 
 def provider(settings: dict):
-    """The only place the backend is chosen."""
-    if os.environ.get("OB_MOCK") == "1":
+    """The only place the backend is chosen.
+
+    `claude` is the odd one: it doesn't generate anything itself, it parks the
+    request and waits for an MCP client to write the page and hand it back. It
+    satisfies this interface all the same, which is the entire reason wiring
+    Claude in as the model touched nothing above this line.
+    """
+    backend = os.environ.get("OB_LLM", "").strip().lower()
+    if backend == "claude":
+        return claude
+    if backend == "mock" or os.environ.get("OB_MOCK") == "1":
         return mock
     return ollama
+
+
+def speculates(settings: dict) -> bool:
+    """Is the backend one that should be given work nobody has asked for?
+
+    Ollama is idle between pages and a wrong guess costs only electricity. A turn
+    of Claude's is not idle time, so hovering does not commission a page there.
+    """
+    return bool(getattr(provider(settings), "SPECULATIVE", True))
 
 
 def _today() -> str:
@@ -166,7 +184,16 @@ async def _ensure_site(
 
     task = prefetch.site_task(domain, build)
     try:
-        profile = await task
+        # Shielded, and the shield is the only reason the test below can tell the
+        # two cancellations apart. Cancelling a task cancels whatever that task is
+        # awaiting, so a bare `await task` hands the *shared* job the cancellation
+        # meant for this one request -- and then reads `task.cancelled()` back as
+        # evidence that somebody else had cancelled it. It was true either way, so
+        # every reader who navigated away from a domain mid-profile started a
+        # second profile for the domain they had just left, and then generated the
+        # whole page for nobody. The shield absorbs the cancellation and leaves the
+        # job alone, which is what makes the flag below mean what it says.
+        profile = await asyncio.shield(task)
     except asyncio.CancelledError:
         # Two different things arrive here. If the shared job was cancelled --
         # another tab navigating away from this domain -- we are still owed a

@@ -85,13 +85,25 @@ def site_task(domain: str, factory) -> asyncio.Task:
     return task
 
 
+def _speculating(settings: dict) -> bool:
+    """Both a preference and a property of the backend.
+
+    A local model is idle between pages, so a wrong guess costs only electricity.
+    A backend where every call is somebody's turn is never idle, and guessing
+    there spends a real page's worth of work on a link nobody clicked.
+    """
+    from .generator import speculates  # imported late: generator uses this module
+
+    return bool(settings.get("prefetch", True)) and speculates(settings)
+
+
 def warm_site(domain: str) -> dict:
     """Speculate on a domain nobody has navigated to yet -- a typed address, a
     search result. Far cheaper than guessing at a whole page, and it removes the
     one call that blocks a page before a word of it can be written.
     """
     settings = store.get_settings()
-    if not settings.get("prefetch", True):
+    if not _speculating(settings):
         return {"started": False, "reason": "disabled"}
     if not domain or "." not in domain:
         return {"started": False, "reason": "not a domain"}
@@ -132,10 +144,22 @@ def stream(url: str) -> Broadcast | None:
 
 def start(raw_url: str, from_url: str = "", link_text: str = "") -> dict:
     """Begin writing a page nobody has asked for yet."""
-    settings = store.get_settings()
-    if not settings.get("prefetch", True):
+    if not _speculating(store.get_settings()):
         return {"started": False, "reason": "disabled"}
+    return _begin(raw_url, from_url, link_text)
 
+
+def render(raw_url: str, from_url: str = "", link_text: str = "") -> dict:
+    """Write a page because something asked for it, rather than guessed at it.
+
+    Same job and the same channel as a guess -- so a reader who navigates there
+    while it runs rides it instead of starting a second one -- minus the guard
+    that keeps a backend like Claude from being handed speculative work.
+    """
+    return _begin(raw_url, from_url, link_text)
+
+
+def _begin(raw_url: str, from_url: str = "", link_text: str = "") -> dict:
     url = to_url(raw_url, from_url or None)
     if not url.startswith("http"):
         return {"started": False, "reason": "not a page"}

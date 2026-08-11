@@ -604,7 +604,7 @@ function showNewTab(tab, push) {
   tab.loading = false;
   setTitle(tab, 'New tab');
   setStats(tab, '');
-  setStatus(state.meta.mock ? 'Mock provider — canned pages, no model' : '');
+  setStatus(backendNote());
 
   ensureFrame(tab, entry);
   entry.html = startPageHtml();
@@ -986,7 +986,16 @@ function wire() {
   };
 
   $('closeWizard').onclick = () => { $('wizard').hidden = true; };
-  $('health').onclick = () => checkSetup(true);
+  /* The wizard installs and tunes a local model, so on a backend that isn't one
+     the dot has nothing to open. It re-checks and says what it found instead --
+     which for Claude is usually "no session attached", and the fix for that is
+     in the terminal, not in here. */
+  $('health').onclick = async () => {
+    if (state.meta.provider === 'ollama') return checkSetup(true);
+    await refreshHealth();
+    const h = state.health || {};
+    setStatus(h.ok ? (h.note || 'Ready') : `${h.message || 'Not ready'}${h.hint ? ' — ' + h.hint : ''}`);
+  };
 }
 
 /* ----------------------------------------------------------------- history */
@@ -1028,7 +1037,7 @@ function openSettings() {
   fill($('setStyle'), state.meta.styles, s.style);
   fill($('setEffort'), state.meta.efforts, s.effort);
 
-  $('settingsNote').textContent = state.meta.mock ? 'Running the mock provider (OB_MOCK=1) — no model is involved.' : '';
+  $('settingsNote').textContent = backendNote(true);
   $('settingsModal').hidden = false;
   loadModels();
 }
@@ -1097,9 +1106,11 @@ async function refreshHealth() {
     state.health = data;
     dot.className = 'health ' + (data.ok ? 'ok' : 'bad');
     const gpu = data.gpu && data.gpu.loaded ? ` · loaded, ${data.gpu.percent}% on GPU` : (data.ok ? ' · idle' : '');
+    /* A backend with no VRAM to report says what it has to say in `note` --
+       "idle" is a fact about a local model, and a wrong one about the others. */
     dot.title = data.ok
-      ? `${data.model} on ${data.endpoint}${gpu}`
-      : `${data.message || 'Ollama unreachable'} — click to set it up`;
+      ? (data.note || `${data.model} on ${data.endpoint}${gpu}`)
+      : `${data.message || 'Ollama unreachable'}${data.hint ? ' — ' + data.hint : ' — click to set it up'}`;
   } catch (err) {
     dot.className = 'health bad';
     dot.title = 'The browser server is not answering.';
@@ -1108,8 +1119,23 @@ async function refreshHealth() {
 
 /* ------------------------------------------------------------------ wizard */
 
+/* Who is writing the pages. Everything below `ollama` is a backend the setup
+   wizard has nothing to say about -- it installs and tunes a local model, and
+   neither the mock nor Claude is one. */
+function backendNote(long) {
+  if (state.meta.provider === 'mock') {
+    return long ? 'Running the mock provider (OB_MOCK=1) — no model is involved.'
+                : 'Mock provider — canned pages, no model';
+  }
+  if (state.meta.provider === 'claude') {
+    return long ? 'Claude is the model (OB_LLM=claude) — pages arrive over MCP, and the settings below that tune a local model do nothing.'
+                : 'Claude is writing the pages';
+  }
+  return '';
+}
+
 async function checkSetup(force) {
-  if (state.meta.mock && !force) return;
+  if (state.meta.provider !== 'ollama' && !force) return;
   try {
     state.setup = await fetch('/api/setup/status').then((r) => r.json());
   } catch (err) {

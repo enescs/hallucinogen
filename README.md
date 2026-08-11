@@ -36,6 +36,9 @@ Want to see the thing move before committing to a 5 GB download:
 OB_MOCK=1 .venv/bin/python run.py     # canned pages, no model involved
 ```
 
+Or skip the local model entirely and let Claude write the pages — see
+[Claude as the model](#claude-as-the-model).
+
 Doing it by hand instead:
 
 ```bash
@@ -284,10 +287,93 @@ URLs that imply software — `/play/...`, `tetris.io`, a watch page — are buil
 whole, so the page around a game paints as it is written but a half-finished game
 never runs.
 
+## Claude as the model
+
+The browser doesn't care what writes its pages. `generator.provider()` picks a
+module, that module answers `chat_stream` and `chat_json`, and everything else —
+the site profile, the `<main>`-only contract, the retry on a refusal, the
+streaming results page, the cache — is written against that interface and nothing
+else. `mock.py` was the first proof of it. `claude.py` is the second:
+
+```bash
+OB_LLM=claude .venv/bin/python run.py     # then open Claude Code in this project
+```
+
+Ask Claude to serve the browser (`/serve-browser`), open the page, and type a
+domain. The tab says what it always says; the difference is who is on the other
+end of it.
+
+What makes that awkward is direction. Ollama is a daemon this process calls.
+Claude is a client that calls *us*, and MCP has no way for a server to ask its
+client's model for text — `sampling` is exactly that request and Claude Code
+doesn't implement it. So `claude.py` generates nothing. It parks the request in
+`broker.py` and waits, and the page reaches Claude the only way MCP allows: as
+the result of a tool call it made, or as an event pushed into its session.
+
+Which gives two ways to run it, one env var apart:
+
+- **Pull.** Claude calls `next_request`, which blocks until somebody browses,
+  writes the page, calls `write_page`, and goes back for the next one. Works
+  anywhere. Costs a loop that has to keep running.
+- **Push.** `OB_MCP_CHANNEL=1` makes the MCP server a
+  [channel](https://code.claude.com/docs/en/channels-reference): the request is
+  pushed into the session the moment you press enter, and no loop is involved.
+  Channels are research preview, so the session needs
+  `claude --dangerously-load-development-channels server:offline-browser`.
+
+Both share one queue, so a request is handed over exactly once either way.
+
+It also runs the other direction. `visit` commissions a URL nobody is looking at,
+`rendered_page` reads back what it became — which is the browser as something to
+drive rather than something to read.
+
+### Nothing gets looked up
+
+A local model has no tools, so "invent it" was never a rule anyone had to write
+down — it was the only thing a model *could* do. Claude has a browser, a search
+tool and a filesystem, and using any of them here would quietly turn an imagined
+web into a researched one: real prices, real usernames, the actual layout of the
+actual site. That is the one page this browser must never serve, because the gap
+between what a model thinks `instagram.com` is and what it actually is *is* the
+product.
+
+So the ban is stated three times, at the three moments it could be forgotten: in
+the MCP server's `instructions`, which land in the system prompt; in the
+`/serve-browser` skill; and at the top of every single brief, above the rules,
+where it cannot be scrolled past. Being wrong in an interesting way is the
+output. Being right by looking it up is the failure.
+
+The rule lives in the MCP layer rather than in `prompts.py` on purpose — those
+prompts are shared with the local model, and spending tokens telling Ollama not
+to use tools it does not have would be a tax on every page for nothing.
+
+Three other things are genuinely different, and none of them are hidden:
+
+- **A page takes a turn, not twenty seconds.** Roughly a minute, and the whole of
+  it is quiet — no fans, no VRAM, no 8 GB of weights. What comes back is a page
+  written by a frontier model rather than by 8B parameters running locally, which
+  is the entire point of the exercise.
+- **Nothing streams.** An answer arrives whole, as the argument of a tool call.
+  `claude.py` cuts it back into deltas before handing it up, which is not theatre:
+  every stage above it — the `<think>` and `<style>` filters, the app mode's
+  held-back `<script>`, the results page's incremental JSON reader — is written
+  against a stream, and a 60KB page arriving in one piece parses and reflows as
+  one piece.
+- **Hovering stops guessing.** Speculation assumes a model that is idle between
+  pages and costs only electricity when it guesses wrong. A turn is neither, so
+  `SPECULATIVE = False` and prefetch quietly steps aside. Which is also why
+  `MAX_JOBS` never mattered until now: with a local model the queue was the
+  bottleneck, and here the queue is the interface.
+
 ## Nothing reaches out
 
-The only outbound connection in the whole program is to Ollama on localhost, plus
-whatever the setup wizard downloads when you press its buttons. Generated pages
+With Ollama, the only outbound connection in the whole program is to it on
+localhost, plus whatever the setup wizard downloads when you press its buttons.
+
+`OB_LLM=claude` is the exception, and it is worth stating plainly: the page
+prompts go to Anthropic, because that is where the model is. Everything else
+holds — the browser still fetches nothing, still has no index, still invents
+every page. It just invents them somewhere else. Generated pages
 are locked down harder than that: a strict CSP (`default-src 'none'`,
 `connect-src 'none'`) and a guard script that replaces `fetch`, `XMLHttpRequest`,
 `WebSocket` and `window.open` before any page script runs. Links and form
@@ -324,10 +410,13 @@ the keyboard.
 ```
 run.py              start the server
 setup.py            terminal setup wizard
+mcp_server.py       the browser over MCP — and, with OB_LLM=claude, its model
 server/
   app.py            routes; the page stream is server-sent events
   generator.py      URL → site profile → page/app/search, retries, fallback
   ollama.py         the only file that talks to Ollama
+  claude.py         the backend that generates nothing and waits to be answered
+  broker.py         requests parked for a worker that isn't a local model
   prompts.py        what the web is told to be
   theme.py          the stylesheet the model no longer writes, one per web era
   prefetch.py       speculative generation and its cancellation
