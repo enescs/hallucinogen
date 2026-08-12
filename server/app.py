@@ -231,12 +231,17 @@ async def api_llm_next(wait: float = Query(25.0, description="seconds to hold th
 
 @app.post("/api/llm/respond")
 async def api_llm_respond(body: dict = Body(default={})):
-    """The answer to one request: HTML for a page, JSON for a profile or a search."""
+    """The answer to one request, or a piece of it.
+
+    HTML for a page, JSON for a profile or a search. `more` says another piece is
+    coming and keeps the request open; `part` labels one that isn't page text --
+    "site" is the profile half of a batched first visit.
+    """
     request_id = str(body.get("id") or "").strip()
     content = body.get("content")
     if not request_id or not isinstance(content, str):
         return JSONResponse({"ok": False, "reason": "id and content are both required"}, status_code=400)
-    return broker.deliver(request_id, content)
+    return broker.deliver(request_id, content, part=str(body.get("part") or ""), more=bool(body.get("more")))
 
 
 @app.post("/api/llm/fail")

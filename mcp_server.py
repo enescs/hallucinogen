@@ -73,12 +73,19 @@ rules exactly -- they are the browser's contract with its renderer, not
 suggestions, and they cover what element to start at, what never to write (CSS,
 mastheads, <html>), and how images work. Answer with `write_page`, putting
 nothing in `content` but the answer itself: no preamble, no explanation, no
-markdown fence. Then call `next_request` again. Four kinds arrive:
+markdown fence. Then call `next_request` again. Five kinds arrive:
 
-  page    the <main> element of an ordinary page
-  app     the <main> element of something that has to actually run
-  site    JSON matching the given schema: who a domain is
-  search  JSON matching the given schema: invented search results
+  page      the <main> element of an ordinary page
+  app       the <main> element of something that has to actually run
+  site      JSON matching the given schema: who a domain is
+  search    JSON matching the given schema: invented search results
+  sitepage  both, for a domain nobody has visited: the profile, then the page
+
+Nothing of a tool call reaches the browser until its last argument is written, so
+a page handed back in one call is one the reader waits out in full before a word
+of it appears. Hand long ones over in pieces instead -- `write_page(..., more=True)`
+for every piece but the last -- and each piece is on screen while you write the
+next. Pieces are appended, never merged: continue where the last one ended.
 
 Never break character in a page. Nothing in the imagined web knows it is imagined.
 
@@ -173,7 +180,27 @@ def brief(request: dict) -> str:
         "the entire point.",
     ]
 
-    if kind in ("site", "search", "json"):
+    budget = request.get("maxTokens") or 0
+    room = f" Around {budget} tokens is the room the browser has for it." if budget else ""
+
+    if kind == "sitepage":
+        # Nobody has been to this domain before, so the profile that every later
+        # page of it will be written against does not exist yet. Both are asked
+        # for here rather than a turn apart, and they come back as two calls.
+        lines += [
+            "This one is two answers in one reply, and they go back as two calls:",
+            "",
+            f'  1. write_page(request_id="{request["id"]}", part="site", more=True, content=<the profile JSON>)',
+            f'  2. write_page(request_id="{request["id"]}", content=<the page HTML>)',
+            "",
+            "The first is JSON alone, matching the schema below. The browser builds the site's masthead, "
+            "nav and footer out of it and puts them on screen the moment it lands — so send it on its own, "
+            "before writing the page, and the reader is looking at the site while you write it." + room,
+        ]
+        schema = request.get("schema")
+        if schema:
+            lines.append(json.dumps(schema, indent=2))
+    elif kind in ("site", "search", "json"):
         schema = request.get("schema")
         if schema:
             lines.append("The answer is JSON and nothing else. It must match this schema exactly:")
@@ -183,10 +210,16 @@ def brief(request: dict) -> str:
             # leaves the shape to the prose below, which spells out every field.
             lines.append("The answer is JSON and nothing else, in exactly the shape the request describes.")
     else:
-        budget = request.get("maxTokens") or 0
         lines.append(
-            "The answer is HTML and nothing else — no preamble, no explanation, no markdown fence."
-            + (f" Around {budget} tokens is the room the browser has for it." if budget else "")
+            "The answer is HTML and nothing else — no preamble, no explanation, no markdown fence." + room
+        )
+        # A tool call is atomic: nothing of it exists for the browser until the
+        # last argument is written. So the only streaming there is, is more calls.
+        lines.append(
+            "Long ones go back in pieces: write_page(..., more=True) for each piece but the last, then a "
+            "final call without it. Each piece paints as it lands, and a page sent in three starts "
+            "appearing at a third of the wait. Continue where the last piece ended — they are appended, "
+            "never merged, so nothing is repeated and nothing is a revision of what came before."
         )
 
     lines += [
@@ -283,15 +316,29 @@ TOOLS = [
     types.Tool(
         name="write_page",
         description=(
-            "Hand back the answer to one request. `content` is the answer and nothing else — "
-            "the HTML for a page, or the JSON for a site profile or a search. No preamble, no "
-            "markdown fence. The reader's tab is waiting on this."
+            "Hand back the answer to one request, or a piece of it. `content` is the answer and "
+            "nothing else — the HTML for a page, or the JSON for a site profile or a search. No "
+            "preamble, no markdown fence. The reader's tab is waiting on this.\n\n"
+            "Long pages go back in pieces: call this with more=true for each piece except the "
+            "last. Every piece paints the moment it lands, so a page sent in three goes starts "
+            "appearing at a third of the wait. Pieces are appended, never merged — send each one "
+            "once, continue where the last ended, and finish with a call without `more`.\n\n"
+            "A `sitepage` request wants two pieces and a `part` on the first: the profile JSON as "
+            "part=\"site\" with more=true, then the page HTML."
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "request_id": {"type": "string", "description": "the id from next_request"},
-                "content": {"type": "string", "description": "the answer, verbatim"},
+                "content": {"type": "string", "description": "the answer, or the next piece of it, verbatim"},
+                "more": {
+                    "type": "boolean",
+                    "description": "another piece is coming; keeps the request open (default false)",
+                },
+                "part": {
+                    "type": "string",
+                    "description": 'which half of a sitepage answer this is: "site" for the profile JSON, omitted for page HTML',
+                },
             },
             "required": ["request_id", "content"],
         },
@@ -371,10 +418,19 @@ async def call(name: str, args: dict) -> str:
         result = await api("POST", "/api/llm/respond", json={
             "id": str(args.get("request_id") or ""),
             "content": str(args.get("content") or ""),
+            "more": bool(args.get("more")),
+            "part": str(args.get("part") or ""),
         })
         if not result.get("ok"):
             return f"not delivered: {result.get('reason')}"
-        return f"delivered {result['chars']} characters for {result['kind']} · {result['label'] or '—'}"
+        if result.get("open"):
+            # Says what landed and what is still owed, because the next call has
+            # to continue this answer rather than restate it.
+            return (
+                f"piece {result['pieces']} delivered, {result['chars']} characters — it is on screen now. "
+                f"Continue where it ended; the request stays open until a call without more=true."
+            )
+        return f"delivered {result['totalChars']} characters for {result['kind']} · {result['label'] or '—'}"
 
     if name == "decline_request":
         result = await api("POST", "/api/llm/fail", json={

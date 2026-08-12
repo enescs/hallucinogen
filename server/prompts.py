@@ -241,23 +241,32 @@ SITE_SYSTEM = _COMMON_SYSTEM + _ASIDE + (
 )
 
 
+_SITE_FIELDS = [
+    "- name: the site's brand name",
+    "- tagline: a short slogan, under 8 words",
+    f"- kind: one of {_SITE_KINDS}",
+    "- description: ONE sentence on what this site serves and who visits it",
+    '- voice: three or four words on how its copy sounds, e.g. "dry and technical"',
+    '- nav: 4 to 6 top-level entries, each {label, href}, href a root-relative path like "/archive"',
+]
+
+_SITE_CLOSING = [
+    "If you recognise the domain, answer with your impression of it. If you don't, invent it with total",
+    "confidence. Keep every field short. Never leave one blank, never ask a question, never explain yourself.",
+]
+
+
 def site_messages(domain: str, settings: dict, hint: str = "") -> list[dict]:
     lines = [
         f"Domain: {domain}",
         "",
         "Return JSON with:",
-        "- name: the site's brand name",
-        "- tagline: a short slogan, under 8 words",
-        f"- kind: one of {_SITE_KINDS}",
-        "- description: ONE sentence on what this site serves and who visits it",
-        '- voice: three or four words on how its copy sounds, e.g. "dry and technical"',
-        '- nav: 4 to 6 top-level entries, each {label, href}, href a root-relative path like "/archive"',
+        *_SITE_FIELDS,
         "",
         "If the domain suggests a game, arcade, tool or toy, say so in `kind` -- that site will serve software",
         "you can actually use, not articles about it.",
         "",
-        "If you recognise the domain, answer with your impression of it. If you don't, invent it with total",
-        "confidence. Keep every field short. Never leave one blank, never ask a question, never explain yourself.",
+        *_SITE_CLOSING,
     ]
     if hint:
         lines.insert(1, f"A visitor reached it via: {hint}")
@@ -424,6 +433,69 @@ def app_messages(url: str, site: dict, settings: dict, today: str, referrer: str
     return _messages(
         APP_SYSTEM, url, site, settings, today, referrer, link_text, "Build it now, complete and working on the first load."
     )
+
+
+# --------------------------------------------------------------- a first visit
+# A domain nobody has been to needs two things written before anything can be on
+# screen: who the site is, and the page. Against a local model that is two calls
+# a fraction of a second apart, and asking separately keeps both prompts small.
+# Against a backend where every call is somebody's whole turn, the first one is
+# pure latency -- so this asks for both at once and takes the answer in two
+# pieces, the profile first, the page under it.
+#
+# Which rule set travels with it has to be chosen before the profile exists, so
+# it is chosen from the URL alone. A domain that turns out to be an arcade still
+# gets an ordinary page on this one visit; every later page on it routes on the
+# stored `kind` and gets the app rules, which is the same thing that happens
+# today when the URL gives nothing away.
+
+_SITEPAGE_ASK = (
+    "TWO ANSWERS, IN ORDER, IN THIS ONE REPLY. Nobody has visited this domain before, so the site's identity "
+    "does not exist yet -- you are deciding it now, and it is kept and reused unchanged on every later page of "
+    "the site. Commit to it.\n\n"
+    "PART ONE is the site profile: JSON, and nothing but JSON. No markup, no <main>, not a word around it.\n"
+    "PART TWO is the page at the URL, under every rule above, consistent with the profile you just wrote.\n\n"
+    "The masthead, its nav and the footer are built from your profile and put on screen around your page. That "
+    "is what part one is for -- writing them again inside <main> puts two of each on the screen."
+)
+
+
+def sitepage_messages(
+    url: str,
+    domain: str,
+    settings: dict,
+    today: str,
+    interactive: bool = False,
+    referrer: str = "",
+    link_text: str = "",
+) -> list[dict]:
+    """One request for a domain's profile and its first page, answered in two parts."""
+    system = "\n".join(
+        [APP_SYSTEM if interactive else page_system(settings.get("effort", "normal")), "", _SITEPAGE_ASK]
+    )
+
+    lines = [f"URL: {url}", f"Domain: {domain}", f"Today: {today}"]
+    if referrer:
+        arrived = f"Arrived from: {referrer}"
+        if link_text:
+            arrived += f' (clicked the link "{link_text}")'
+        lines.append(arrived)
+
+    lines += [
+        "",
+        "PART ONE — the profile. JSON with:",
+        *_SITE_FIELDS,
+        "",
+        *_SITE_CLOSING,
+        "",
+        "PART TWO — the page this URL serves, on that site.",
+        "",
+        f"Editorial character: {style_brief(settings.get('style', 'modern'))}",
+        "",
+        "Both now: the profile, then the page.",
+    ]
+
+    return [{"role": "system", "content": system}, {"role": "user", "content": "\n".join(lines)}]
 
 
 def _messages(

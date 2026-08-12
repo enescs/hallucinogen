@@ -14,12 +14,14 @@ session as a channel event.
 
 Two consequences worth knowing about, both handled here:
 
-*Nothing streams.* An answer arrives whole, as the argument of a tool call, so
-the deltas below are cut from finished text. That is not theatre: the filters,
-the app mode's held-back <script> and the SERP's incremental reader are all fed a
-stream by contract, and a page that lands in one 60KB piece parses and reflows as
-one 60KB piece. Chopped up, the page paints as it did before, and every stage
-downstream stays honest.
+*Streaming is coarse.* A tool call is atomic -- the server sees nothing of it
+until every argument is written -- so the finest grain available is a piece per
+call, and a worker that hands a page back in one piece is a page the reader waits
+out in full. `write_page` takes a `more` flag for exactly this: pieces arrive,
+each goes to the tab as it lands, and the deltas below are cut from whatever has
+arrived rather than from a finished answer. The subdivision stays either way,
+because a single piece can be a whole 60KB game and one 60KB delta parses and
+reflows as one 60KB delta.
 
 *Speculation is off.* Hovering a link would spend a whole turn on a page nobody
 asked for. `SPECULATIVE = False` is what prefetch.py reads to stay out of the way.
@@ -39,6 +41,13 @@ PROVIDER = "claude"
 # Read by prefetch.py. A guess costs a whole turn here, and the model is not
 # sitting idle between pages waiting to be given one.
 SPECULATIVE = False
+
+# Read by generator.py. A domain nobody has visited needs a site profile before
+# its first page can be written, and against a local model that is a second call
+# costing a fraction of a second. Here it is a second *turn*, with everything a
+# turn costs -- so this backend would rather be asked for both at once and answer
+# in two pieces: the profile, then the page under it.
+BATCHES_SITE = True
 
 MODEL = "claude-code"
 
@@ -92,19 +101,15 @@ async def warmup(settings: dict, model: str | None = None, prime: str = "") -> d
 # --------------------------------------------------------------------------- chat
 
 
-def _apply_stop(text: str, stop: list[str]) -> str:
-    """Cut at the first stop sequence, the way Ollama does -- excluding it.
+def _first_stop(text: str, stop: list[str]) -> int | None:
+    """Where the first stop sequence begins, the way Ollama cuts -- excluding it.
 
     `PAGE_STOP` is `</main>`, and dropping it leaves the element open for
     close_fragment() to close, which is exactly the shape the generator expects
     from a local model.
     """
-    cut = len(text)
-    for needle in stop:
-        found = text.find(needle)
-        if found != -1:
-            cut = min(cut, found)
-    return text[:cut]
+    found = [at for at in (text.find(needle) for needle in stop) if at != -1]
+    return min(found) if found else None
 
 
 async def chat_stream(
@@ -127,8 +132,42 @@ async def chat_stream(
     )
 
     started = time.monotonic()
+    seen = ""  # every character of the answer that has arrived
+    emitted = 0  # how much of it has gone out as deltas
+    # A stop sequence split across two pieces -- "</ma" ending one and "in>"
+    # opening the next -- would be missed by a search of either. Hold back one
+    # character less than the longest needle and it cannot straddle the seam.
+    hold = max((len(needle) for needle in job.stop), default=1) - 1
+
+    pieces = broker.stream(job)
     try:
-        text = await broker.result(job)
+        async for part, text in pieces:
+            if part == "site":
+                # The profile half of a batched request: a site's identity, not
+                # a word of its page. The generator takes it, puts the masthead
+                # on screen, and the page that follows lands under it.
+                yield {"type": "profile", "text": text}
+                continue
+
+            seen += text
+            cut = _first_stop(seen, job.stop)
+            end = cut if cut is not None else max(emitted, len(seen) - hold)
+            while emitted < end:
+                # Still sliced: one piece can be a whole 60KB game, and handing
+                # that to the SSE pump entire is a 60KB reflow.
+                take = min(_CHUNK, end - emitted)
+                yield {"type": "delta", "text": seen[emitted : emitted + take]}
+                emitted += take
+                await asyncio.sleep(0)  # let the pump flush this one before the next
+            if cut is not None:
+                seen = seen[:cut]
+                break
+        else:
+            # Ran to the end with no stop sequence: what was held back for the
+            # seam is just the tail of the answer.
+            if emitted < len(seen):
+                yield {"type": "delta", "text": seen[emitted:]}
+                emitted = len(seen)
     except asyncio.TimeoutError as err:
         if broker.attached():
             raise OllamaError(
@@ -147,16 +186,11 @@ async def chat_stream(
         # Cancelling this request, or closing the generator around it, lands here
         # too: a reader who navigated away should not leave a job in the queue
         # for somebody to spend a turn answering.
+        await pieces.aclose()
         broker.abandon(job)
 
-    text = _apply_stop(text, job.stop)
-
-    for i in range(0, len(text), _CHUNK):
-        yield {"type": "delta", "text": text[i : i + _CHUNK]}
-        await asyncio.sleep(0)  # let the SSE pump flush this one before the next
-
     elapsed = time.monotonic() - started
-    tokens = round(len(text) / 3.6)
+    tokens = round(len(seen) / 3.6)
     yield {
         "type": "done",
         "stats": {

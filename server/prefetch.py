@@ -72,6 +72,17 @@ _site_jobs: dict[str, asyncio.Task] = {}
 _warming: dict[str, asyncio.Task] = {}
 
 
+def site_pending(domain: str) -> bool:
+    """Is somebody already generating this domain's profile?
+
+    Asked by the batched first visit, which folds the profile into the page
+    request: joining a job that is already running is cheaper than asking for
+    the same 220 tokens a second time inside a bigger prompt.
+    """
+    task = _site_jobs.get(domain)
+    return bool(task) and not task.done()
+
+
 def site_task(domain: str, factory) -> asyncio.Task:
     """The in-flight profile job for `domain`, starting it if nobody has yet."""
     task = _site_jobs.get(domain)

@@ -5,72 +5,85 @@ description: Act as the offline browser's rendering model — start it if needed
 
 # Serving the offline browser
 
-You are the model. The browser at `http://127.0.0.1:8765` has no other one: with
-`HLG_LLM=claude` every page it wants is parked in a queue and waits for you.
+The browser at `http://127.0.0.1:8765` has no model of its own: with
+`HLG_LLM=claude` every page it wants is parked in a queue and waits for a Claude
+session to write it.
+
+Serving happens in a **`page-writer` subagent**, not in this conversation. Two
+reasons, both about latency. A page's brief is self-contained, so the growing
+history of this conversation is pure overhead on every request — a fresh, small
+context stays fast from page one to page fifty. And the subagent can run on a
+faster model than whatever this session happens to be, which matters more than
+anything else here: the reader stares at a masthead until the whole page lands,
+so output speed *is* the experience.
 
 ## Start
 
-1. `browser_status`. If it isn't running, `start_browser`, then tell the user to
-   open the URL it returns. If it reports a provider other than `claude`, say so —
-   pages are being written by that instead, and the fix is restarting it with
-   `HLG_LLM=claude`.
-2. Tell the user the browser is yours now and they should start typing in the
-   omnibox.
+1. `browser_status`. If it isn't running, `start_browser`. If it reports a
+   provider other than `claude`, say so — pages are being written by that
+   instead, and the fix is restarting it with `HLG_LLM=claude`.
 
-## The loop
+2. **Pick the model.** Whatever the user named when invoking this skill —
+   `/serve-browser sonnet`, `/serve-browser haiku`, `/serve-browser opus`. Pass
+   it as the Agent tool's `model`. If they named nothing, omit `model` entirely
+   so the subagent inherits this session's — never substitute a default of your
+   own. If they ask which to use: Sonnet is the sweet spot, Haiku is fastest and
+   thinner, Opus is the slowest by a wide margin and the difference shows up as
+   dead time, not obviously better pages.
 
-Call `next_request`. It blocks until somebody browses.
+3. Spawn it, in the background so the user can keep talking to you:
 
-- **A brief comes back.** Write the answer and hand it back with `write_page`.
-  Then call `next_request` again, immediately. Don't summarise the page, don't
-  narrate what you wrote, don't ask whether to continue — the reader is watching
-  the tab, not this terminal. One line at most between requests.
-- **It says idle.** Call it again. Somebody reading a page you just wrote is
-  idle for a minute at a time. Stop only after roughly five idles in a row, or
-  when the user says to, and say plainly that you have stopped serving.
+   ```
+   Agent(subagent_type: "page-writer",
+         model: <only if the user named one>,
+         run_in_background: true,
+         description: "serve offline browser",
+         prompt: "Serve the offline browser. Loop on next_request and write
+                  every brief that comes back, until it reports idle about five
+                  times in a row.")
+   ```
+
+4. Tell the user the browser URL, which model is serving, and that they should
+   start typing in the omnibox. One or two lines — they want to browse, not read.
+
+Then stay out of the way. The subagent serves; you don't poll it, don't
+double-serve alongside it, and don't relay its pages. Its completion
+notification arrives on its own.
+
+## When it comes back
+
+A `page-writer` retires itself after about a dozen requests, because by then its
+context is mostly pages it has already delivered and every new one is read
+against all of them. Its final line says which it was:
+
+- **`rotating after N requests`** — it hit the ceiling, not the end of the
+  reading. Spawn a replacement immediately, same model, same prompt, and say
+  nothing to the user beyond a word that serving continues. The queue holds
+  while there's no worker, so the gap costs a moment, not a page.
+- **idle, or the user said stop** — serving is over. Say so plainly.
+- **anything else** — report what it said. A worker that died mid-page leaves a
+  reader on a half-written one, and the fix is usually another worker.
+
+If the Agent tool isn't available in this session, serve inline instead: run the
+loop yourself exactly as [the page-writer definition](../../agents/page-writer.md)
+describes it, and follow every rule in it — especially that you look nothing up
+while serving.
+
+## While it serves
+
+- `visit` commissions a URL nobody asked for. It returns immediately and the
+  requests it creates go into the same queue, so the subagent picks them up like
+  any other. `rendered_page` reads back what one became — that's how you inspect
+  a page without taking over the serving loop.
+- More readers, or a faster model mid-session: spawn a second `page-writer`.
+  They pull from one queue, so two serve in parallel without coordination.
+- To stop early, tell the user to say so, or stop the background agent.
 
 ## Never look anything up
 
-While you are serving, **do not use WebSearch, WebFetch, Read, or any other tool that
-reaches the network or the disk.** Not to check what the real site looks like, not to
-get a statistic right, not for a name or a date. Answer from what you already know and
-invent the rest.
-
-This is not a side rule, it is the premise. The browser's whole proposition is that
-typing `instagram.com` does not get you Instagram — it gets you what a model *thinks*
-Instagram is, invented users and invented counts and all, and the gap between those two
-things is the point. A page built from search results closes that gap and is the one
-page this browser must never serve. Being wrong in an interesting way is the product;
-being right by looking it up is the failure.
-
-The only tools you need are `next_request` and `write_page`.
-
-## Writing the answer
-
-The brief carries the browser's own rules. Follow them exactly — they are the
-contract that makes the page fit the site around it, and the parts that look
-strict are the parts that break visibly:
-
-- Start at `<main>`, end at `</main>`, and put nothing outside it. The masthead,
-  nav, stylesheet and footer are already on the page.
-- Never write CSS. No `<style>`, no `style="..."`, no `<link>`. The site's
-  stylesheet is loaded and covers every element and the handful of class names
-  the brief lists.
-- Images are free: `<img alt="a vivid description" width="800" height="450">`
-  with **no src**. The browser draws it. Name the kind in the alt text —
-  "bar chart of…", "portrait of…", "map of…" — rather than drawing an SVG yourself.
-- Link generously, from inside the copy. A page with no links is a dead end, and
-  links are the only way anyone gets anywhere here.
-- `app` briefs mean it has to actually run: real JavaScript, playable from the
-  first keypress, in one `<script>` at the end.
-- `site` and `search` briefs want JSON matching the schema and nothing else.
-
-Stay in character. Nothing in this web knows it is invented — no disclaimers, no
-mention of models or prompts, no apologies. If a URL means nothing to you, commit
-to the most interesting reading of it. Not knowing is the invitation.
-
-## Driving it yourself
-
-`visit` commissions a URL nobody has asked for. It returns immediately, and the
-requests it creates arrive through `next_request` like any other — so answer
-those next, then read the result with `rendered_page`.
+While serving, **nothing is fetched** — not to check what the real site looks
+like, not for a statistic, not for a name or a date. The `page-writer` agent has
+no tools that could, which is deliberate: it is the premise, not a side rule. A
+page built from search results is the one page this browser must never serve.
+The gap between what a model *thinks* `instagram.com` is and what it actually is
+is the entire product.

@@ -11,11 +11,21 @@ up, write the page, and hand it back:
                                             |                  |
                                             |          the worker writes it
                                             |                  |
-                                        (awaits) <----- POST /api/llm/respond
+                                       (consumes) <---- POST /api/llm/respond
+                                                              (x N)
 
 The worker is an MCP server, and through it Claude. There is no pool and no
 fan-out: one page is written at a time, the same as with a local model, because
 the thing on the other end is a conversation and conversations are serial.
+
+An answer arrives in pieces, not all at once. A tool call is atomic -- the server
+sees nothing of it until the model has finished writing every argument -- so a
+page handed back in one call is a page the reader waits out in full before a word
+of it paints. A worker that hands back three pieces gets the first one on screen
+while it is still writing the second, which is the only streaming available to
+something on the far side of a tool call. Hence the queue below rather than a
+single slot: every job is a sequence of chunks that ends when one arrives marked
+final, and each chunk is a piece of the same answer, never a revision of it.
 
 A request nobody picks up has to end -- a tab waiting forever is the one outcome
 worse than a plain page -- so every job has a deadline, and the deadline is short
@@ -28,7 +38,7 @@ import asyncio
 import re
 import secrets
 import time
-from typing import Any
+from typing import Any, AsyncIterator
 
 # A page is a whole turn: reading the rules, then writing a thousand words of
 # HTML. So this is minutes. Nothing is lost by the wait -- the tab is streaming
@@ -49,11 +59,11 @@ class WorkerError(Exception):
 
 
 class Job:
-    """One request for text, and the future waiting on the answer."""
+    """One request for text, and the queue the answer arrives on."""
 
     __slots__ = (
         "id", "kind", "label", "messages", "schema", "max_tokens", "stop",
-        "created", "announced", "future",
+        "created", "announced", "chunks", "parts", "settled",
     )
 
     def __init__(
@@ -74,7 +84,14 @@ class Job:
         self.stop = stop
         self.created = time.monotonic()
         self.announced: float | None = None
-        self.future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        # (part, text) as the worker hands pieces over, then None for the end --
+        # or a WorkerError, for a worker that took the job and gave up on it.
+        self.chunks: asyncio.Queue[Any] = asyncio.Queue()
+        self.parts: list[str] = []
+        # Nothing more is coming: answered in full, declined, or abandoned. Not
+        # the same as "delivered" -- a job mid-answer is unsettled and still
+        # holds a reader's tab open.
+        self.settled = False
 
     @property
     def rules(self) -> str:
@@ -133,29 +150,38 @@ def submit(
     return job
 
 
-async def result(job: Job) -> str:
-    """Wait for the worker's answer. Raises TimeoutError, or WorkerError if it gave up."""
+async def stream(job: Job) -> AsyncIterator[tuple[str, str]]:
+    """Yield (part, text) as the worker hands the answer over, piece by piece.
+
+    Raises TimeoutError, or WorkerError if the worker gave up. The deadline is
+    per piece rather than per answer: a worker that is visibly still writing has
+    not stalled, and the whole reason for handing a page over in pieces is that
+    the pieces are minutes apart on a long one.
+    """
     timeout = ANSWER_TIMEOUT if attached() else NO_WORKER_TIMEOUT
     try:
-        # Shielded so the timeout below doesn't cancel the job's own future while
-        # a worker may still be mid-answer; the finally clause decides its fate.
-        return await asyncio.wait_for(asyncio.shield(job.future), timeout)
+        while True:
+            item = await asyncio.wait_for(job.chunks.get(), timeout)
+            if item is None:
+                return
+            if isinstance(item, Exception):
+                raise item
+            yield item
+            # Whatever the queue said before, something is plainly there now.
+            timeout = ANSWER_TIMEOUT
     finally:
-        if not job.future.done():
-            abandon(job)
-        _jobs.pop(job.id, None)
+        abandon(job)
+
+
+async def result(job: Job) -> str:
+    """The whole answer, for a caller with no use for the pieces."""
+    return "".join([text async for _, text in stream(job)])
 
 
 def abandon(job: Job) -> None:
     """The reader navigated away. Drop it before a worker spends a turn on it."""
     _jobs.pop(job.id, None)
-    if not job.future.done():
-        job.future.cancel()
-    elif not job.future.cancelled():
-        # Read whatever is in there. A worker's refusal that nobody is waiting
-        # for any more is not an unhandled exception, and asyncio would log it
-        # at the end of the loop as though it were.
-        job.future.exception()
+    job.settled = True
 
 
 # ------------------------------------------------------------------- the worker
@@ -171,7 +197,7 @@ def _wake() -> None:
 def _next() -> Job | None:
     """The oldest job no worker has been shown yet."""
     fresh = sorted(
-        (j for j in _jobs.values() if j.announced is None and not j.future.done()),
+        (j for j in _jobs.values() if j.announced is None and not j.settled),
         key=lambda j: j.created,
     )
     if not fresh:
@@ -203,17 +229,38 @@ async def wait_for_job(timeout: float = 25.0) -> Job | None:
                 _waiters.remove(waiter)
 
 
-def deliver(job_id: str, text: str) -> dict:
+def deliver(job_id: str, text: str, part: str = "", more: bool = False) -> dict:
+    """A piece of an answer, or the last piece of one.
+
+    `more` is the worker saying it is still writing: the piece goes straight to
+    the reader and the job stays open for the next one. Without it the job is
+    finished, and a later piece for the same id finds nothing to attach to --
+    which is the intended failure. Pieces accumulate; they never replace.
+    """
     global _served
     attach()
     job = _jobs.get(job_id)
     if job is None:
         return {"ok": False, "reason": "no such request — it was cancelled, or already answered"}
-    if job.future.done():
+    if job.settled:
         return {"ok": False, "reason": "that request is already settled"}
-    job.future.set_result(text)
-    _served += 1
-    return {"ok": True, "id": job_id, "chars": len(text), "kind": job.kind, "label": job.label}
+
+    job.parts.append(text)
+    job.chunks.put_nowait((part, text))
+    if not more:
+        job.chunks.put_nowait(None)
+        job.settled = True
+        _served += 1
+    return {
+        "ok": True,
+        "id": job_id,
+        "chars": len(text),
+        "totalChars": sum(len(p) for p in job.parts),
+        "pieces": len(job.parts),
+        "open": more,
+        "kind": job.kind,
+        "label": job.label,
+    }
 
 
 def requeue(job_id: str) -> dict:
@@ -225,8 +272,12 @@ def requeue(job_id: str) -> dict:
     poll can still serve them.
     """
     job = _jobs.get(job_id)
-    if job is None or job.future.done():
+    if job is None or job.settled:
         return {"ok": False, "reason": "no such request"}
+    if job.parts:
+        # Half of it is already on the reader's screen. Handing the job to
+        # somebody else now would splice two answers together.
+        return {"ok": False, "reason": "that request is already part-answered"}
     job.announced = None
     _wake()
     return {"ok": True, "id": job_id}
@@ -235,9 +286,10 @@ def requeue(job_id: str) -> dict:
 def fail(job_id: str, message: str = "") -> dict:
     attach()
     job = _jobs.get(job_id)
-    if job is None or job.future.done():
+    if job is None or job.settled:
         return {"ok": False, "reason": "no such request"}
-    job.future.set_exception(WorkerError(message or "the worker declined the request"))
+    job.chunks.put_nowait(WorkerError(message or "the worker declined the request"))
+    job.settled = True
     return {"ok": True, "id": job_id}
 
 
@@ -260,7 +312,7 @@ def attached() -> bool:
 
 def snapshot() -> dict:
     now = time.monotonic()
-    waiting = [j for j in _jobs.values() if not j.future.done()]
+    waiting = [j for j in _jobs.values() if not j.settled]
     return {
         "attached": attached(),
         "lastSeenSeconds": round(now - _worker_seen, 1) if _worker_seen else None,
@@ -272,6 +324,7 @@ def snapshot() -> dict:
                 "kind": j.kind,
                 "label": j.label,
                 "announced": j.announced is not None,
+                "pieces": len(j.parts),
                 "waitingMs": round((now - j.created) * 1000),
             }
             for j in sorted(waiting, key=lambda j: j.created)
@@ -303,6 +356,11 @@ def label_from(messages: list[dict]) -> str:
 
 def kind_from(messages: list[dict], schema: Any) -> str:
     rules = "\n".join(m.get("content", "") for m in messages if m.get("role") == "system")
+
+    # Checked before the schema, which is the profile's and would read as a plain
+    # site request -- this one carries the page rules as well and wants both.
+    if "TWO ANSWERS, IN ORDER" in rules:
+        return "sitepage"
 
     if isinstance(schema, dict):
         properties = schema.get("properties") or {}

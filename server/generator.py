@@ -163,6 +163,18 @@ async def _fetch_site(
     return store.put_site(domain, profile)
 
 
+def _adopt_site(domain: str, raw: str, interactive_hint: bool, era: str) -> dict:
+    """The profile half of a batched answer, taken as if it had been fetched alone.
+
+    It is the same profile: normalised the same way, kept on disk the same way,
+    and read back from there by every later page on the domain. All that differs
+    is that nobody waited a turn for it.
+    """
+    profile = _normalize_site(ollama.parse_json(raw), domain, interactive_hint, era)
+    stored = store.put_site(domain, profile)
+    return {**stored, "palette": theme.merge_palette(domain, era, stored.get("palette"))}
+
+
 async def _ensure_site(
     domain: str, settings: dict, model: str, llm, interactive_hint: bool, era: str, referrer: str = ""
 ) -> dict:
@@ -401,37 +413,64 @@ async def stream_page(
                 theme.palette_for(domain, era),
             )
             yield {"type": "chunk", "text": head}
+            prelude = head
 
-            site = await _ensure_site(domain, settings, model, llm, hint, era, from_url)
+            # The profile is the one call that blocks a page, and on a backend
+            # that answers in turns rather than in milliseconds it is a whole
+            # turn spent before a word can be written. So ask for both at once
+            # where the backend can take it: the profile comes back as the
+            # answer's first piece, the page in the pieces after it.
+            batched = (
+                getattr(llm, "BATCHES_SITE", False)
+                and not store.get_site(domain)
+                and not prefetch.site_pending(domain)
+            )
 
-            interactive = prompts.looks_interactive(url, site)
+            if batched:
+                # Chosen from the URL alone, because the profile that would
+                # refine it is being written in the same breath.
+                interactive = hint
+                yield {"type": "status", "text": f"Writing {guess_site_name(domain)}…"}
+            else:
+                site = await _ensure_site(domain, settings, model, llm, hint, era, from_url)
+                interactive = prompts.looks_interactive(url, site)
+
             mode = "app" if interactive else "page"
-            yield {
-                "type": "mode",
-                "mode": mode,
-                "site": {"name": site.get("name"), "kind": site.get("kind")},
-                "text": (
-                    f"Building {site.get('name')} — it starts playing once the code lands."
-                    if interactive
-                    else f"Writing {site.get('name')}…"
-                ),
-            }
+            coda = ""
 
-            # The rest of what the model used to spend a third of its tokens on,
-            # on screen before it has written a word of its own.
-            masthead = theme.site_header(site, domain)
-            yield {"type": "chunk", "text": masthead}
-            prelude = head + masthead
-            coda = theme.site_footer(site, domain, SEARCH_ENDPOINT)
+            if site:
+                yield {
+                    "type": "mode",
+                    "mode": mode,
+                    "site": {"name": site.get("name"), "kind": site.get("kind")},
+                    "text": (
+                        f"Building {site.get('name')} — it starts playing once the code lands."
+                        if interactive
+                        else f"Writing {site.get('name')}…"
+                    ),
+                }
+
+                # The rest of what the model used to spend a third of its tokens
+                # on, on screen before it has written a word of its own.
+                masthead = theme.site_header(site, domain)
+                yield {"type": "chunk", "text": masthead}
+                prelude = head + masthead
+                coda = theme.site_footer(site, domain, SEARCH_ENDPOINT)
 
             builder = prompts.app_messages if interactive else prompts.page_messages
-            messages = builder(url, site, settings, _today(), from_url, link_text)
+            messages = (
+                prompts.sitepage_messages(url, domain, settings, _today(), interactive, from_url, link_text)
+                if batched
+                else builder(url, site, settings, _today(), from_url, link_text)
+            )
 
             # Effort picks the target; numPredict is the ceiling nothing crosses;
             # and neither may promise more room than the context window has, or
             # a game gets cut off mid-function with nothing to say why.
             preset = prompts.effort_preset(settings.get("effort", "normal"))
             target = preset["app"] if interactive else preset["tokens"]
+            if batched:
+                target += prompts.SITE_TOKENS  # the profile rides in the same answer
             room = int(settings.get("numCtx", 8192)) - _prompt_tokens(messages) - 128
             options = {"num_predict": max(256, min(int(settings.get("numPredict", 8192)), target, room))}
             if interactive:
@@ -445,6 +484,13 @@ async def stream_page(
                     # Whatever that was, it wasn't a page. Say so and go again.
                     yield {"type": "restart", "text": "That wasn't a page. Asking again, more firmly…"}
                     said = body.strip() or refusal.strip()
+                    if batched:
+                        # The profile is settled now, one way or the other, so
+                        # the retry is an ordinary page request -- asking for
+                        # both again would re-decide a site already on screen.
+                        batched = False
+                        messages = builder(url, site, settings, _today(), from_url, link_text)
+                        said = ""  # it answered a different question; don't quote it back
                     messages = messages + (
                         [{"role": "assistant", "content": said[:400]}] if said else []
                     ) + [{"role": "user", "content": prompts.RETRY_NUDGE}]
@@ -457,11 +503,40 @@ async def stream_page(
                 body = ""
                 held = ""  # an app's <script>, kept back until it is complete
                 bailed = False
+                # A batched answer opens with the profile, and the masthead is
+                # built from it -- so the page that follows is held for as long
+                # as it takes to arrive, which is one piece, not one generation.
+                withheld = ""
                 cleaner = HtmlCleaner()
-                stream = llm.chat_stream(settings, messages, model=model, options=options)
+                stream = llm.chat_stream(
+                    settings,
+                    messages,
+                    model=model,
+                    options=options,
+                    **({"fmt": prompts.SITE_SCHEMA} if batched else {}),
+                )
                 try:
                     async for event in stream:
-                        if event["type"] == "delta":
+                        if event["type"] == "profile":
+                            site = _adopt_site(domain, event["text"], hint, era)
+                            yield {
+                                "type": "mode",
+                                "mode": mode,
+                                "site": {"name": site.get("name"), "kind": site.get("kind")},
+                                "text": (
+                                    f"Building {site.get('name')} — it starts playing once the code lands."
+                                    if interactive
+                                    else f"Writing {site.get('name')}…"
+                                ),
+                            }
+                            masthead = theme.site_header(site, domain)
+                            prelude = head + masthead
+                            coda = theme.site_footer(site, domain, SEARCH_ENDPOINT)
+                            yield {"type": "chunk", "text": masthead}
+                            if withheld:
+                                yield {"type": "chunk", "text": withheld}
+                                withheld = ""
+                        elif event["type"] == "delta":
                             text = cleaner.push(event["text"])
                             if text:
                                 body += text
@@ -472,7 +547,10 @@ async def stream_page(
                                 else:
                                     visible = text
                                 if visible:
-                                    yield {"type": "chunk", "text": visible}
+                                    if site:
+                                        yield {"type": "chunk", "text": visible}
+                                    else:
+                                        withheld += visible
                         elif event["type"] == "done":
                             stats = event.get("stats")
 
@@ -499,6 +577,20 @@ async def stream_page(
                     # URL. `refusal` already has the opening, for the nudge.
                     body = ""
                 else:
+                    if not site:
+                        # A batched answer that never sent its first part. The
+                        # page still needs something to sit under, so furnish a
+                        # profile here -- but don't keep it: a domain deserves a
+                        # real one the next time somebody asks for it.
+                        site = prompts.fallback_site(domain, guess_site_name(domain), interactive, era)
+                        masthead = theme.site_header(site, domain)
+                        prelude = head + masthead
+                        coda = theme.site_footer(site, domain, SEARCH_ENDPOINT)
+                        yield {"type": "chunk", "text": masthead}
+                        if withheld:
+                            yield {"type": "chunk", "text": withheld}
+                            withheld = ""
+
                     tail = cleaner.flush()
                     if tail:
                         body += tail
