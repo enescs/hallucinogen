@@ -15,6 +15,9 @@ at, and this repository has enough imagined software in it already.
 
 ## Running it
 
+Python 3.10 or newer — the floor is `requirements.txt`'s rather than the code's,
+and both entry points say so and stop rather than letting pip explain it.
+
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 HLG_MOCK=1 .venv/bin/python run.py

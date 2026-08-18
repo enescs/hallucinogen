@@ -19,9 +19,21 @@ import ipaddress
 import os
 import sys
 
-import uvicorn
+# Ahead of the third-party imports rather than beside them, because below 3.10
+# there is nothing to import: fastapi, uvicorn and mcp all declare
+# Requires-Python >=3.10, and "No module named uvicorn" is a worse way to find
+# that out than being told which python to use.
+MIN_PYTHON = (3, 10)
+if sys.version_info < MIN_PYTHON:
+    sys.exit(
+        f"\n  hallucinogen needs Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]} or newer, and this "
+        f"one is {sys.version.split()[0]}.\n  Recreate the venv with a newer python, then "
+        "run this with the interpreter inside it.\n"
+    )
 
-from server.store import ensure_dirs
+import uvicorn  # noqa: E402  (after the version check, which is the point)
+
+from server.store import ensure_dirs  # noqa: E402
 
 # Binding anywhere but loopback is the one configuration change that turns this
 # from a private hallucination into something served to other people, and none

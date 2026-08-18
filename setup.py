@@ -23,6 +23,19 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+# Nothing in this file needs 3.10 -- it is stdlib only, so that it can run before
+# the venv exists -- but everything it installs does: fastapi, uvicorn and mcp
+# all declare Requires-Python >=3.10. On anything older the venv gets created and
+# pip then fails to resolve a single dependency, which is a resolver backtrace to
+# read instead of a sentence.
+MIN_PYTHON = (3, 10)
+if sys.version_info < MIN_PYTHON:
+    sys.exit(
+        f"\n  hallucinogen needs Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]} or newer, and this "
+        f"one is {platform.python_version()}.\n  Install a newer python and run the wizard "
+        "with that one.\n"
+    )
+
 ROOT = Path(__file__).resolve().parent
 VENV = ROOT / ".venv"
 INSTALL_URL = "https://ollama.com/install.sh"

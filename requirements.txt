@@ -1,3 +1,5 @@
+# Python 3.10 or newer: fastapi, uvicorn and mcp all require it, and the version
+# floor of this project is theirs rather than anything the code itself needs.
 fastapi>=0.115
 uvicorn[standard]>=0.30
 httpx>=0.27

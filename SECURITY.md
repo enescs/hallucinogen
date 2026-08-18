@@ -4,7 +4,7 @@
 
 Open a [private security advisory](https://github.com/enescs/hallucinogen/security/advisories/new)
 rather than a public issue. If that isn't available to you, email
-goksueneskerem@gmail.com.
+eneskerembus@gmail.com.
 
 This is a hobby project maintained by one person: there is no bounty, no SLA and
 no guaranteed response time, and it will be looked at when it is looked at.

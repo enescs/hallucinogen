@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"$CLAUDE_PROJECT_DIR/.claude/hooks/no_external_sources.py\"",
+            "command": "sh \"$CLAUDE_PROJECT_DIR/.claude/hooks/no_external_sources.sh\"",
             "timeout": 5,
             "statusMessage": "checking the browser isn't being served"
           }

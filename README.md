@@ -22,6 +22,9 @@ That gap is the whole point.
 
 ## Quick start
 
+Python 3.10 or newer, and around 5 GB of disk for a model. Nothing else — the
+dependencies are three packages and a local Ollama.
+
 Linux and macOS:
 
 ```bash
