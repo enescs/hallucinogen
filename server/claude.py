@@ -23,8 +23,11 @@ arrived rather than from a finished answer. The subdivision stays either way,
 because a single piece can be a whole 60KB game and one 60KB delta parses and
 reflows as one 60KB delta.
 
-*Speculation is off.* Hovering a link would spend a whole turn on a page nobody
-asked for. `SPECULATIVE = False` is what prefetch.py reads to stay out of the way.
+*Speculation is on, and ranked.* Hovering a link spends a whole turn on a page
+nobody asked for, which is affordable only because the queue has an order: a
+guess is written behind every page a reader is watching, and by a worker that
+would otherwise be blocked in `next_request`. `SPECULATIVE` is what prefetch.py
+reads; `broker.P_GUESS` is where those jobs sit.
 """
 
 from __future__ import annotations
@@ -38,9 +41,14 @@ from .ollama import OllamaError, parse_json  # noqa: F401  (generator catches th
 
 PROVIDER = "claude"
 
-# Read by prefetch.py. A guess costs a whole turn here, and the model is not
-# sitting idle between pages waiting to be given one.
-SPECULATIVE = False
+# Read by prefetch.py. A guess costs a whole turn here, which was the reason
+# this was off: a turn of Claude's is not the idle time a local model's GPU is
+# between pages. What changed is that there is more than one worker now and the
+# queue has an order, so a guess is written by a worker that would otherwise be
+# blocked in `next_request` doing nothing, and it is written *behind* every page
+# somebody is actually waiting for. The cost is tokens; the return is a click
+# that lands on a page that already exists.
+SPECULATIVE = True
 
 # Read by generator.py. A domain nobody has visited needs a site profile before
 # its first page can be written, and against a local model that is a second call
@@ -197,6 +205,11 @@ async def chat_stream(
             "model": MODEL,
             "promptTokens": round(sum(len(m.get("content", "")) for m in messages) / 3.6),
             "tokens": tokens,
+            # Where the wait went, rather than only how long it was: time spent
+            # in the queue before a worker took it, and time until the first
+            # piece painted. One end-to-end number cannot tell a slow writer
+            # from a busy queue, and they want opposite fixes.
+            **job.timings(),
             # End to end, thinking included. It is the number a reader felt.
             "tokensPerSecond": round(tokens / elapsed, 1) if elapsed > 0.05 else None,
             "totalMs": round(elapsed * 1000),

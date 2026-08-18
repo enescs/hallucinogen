@@ -27,15 +27,33 @@ ROOT = Path(__file__).resolve().parent
 VENV = ROOT / ".venv"
 INSTALL_URL = "https://ollama.com/install.sh"
 DEFAULT_ENDPOINT = "http://127.0.0.1:11434"
+MCP_CONFIG = ROOT / ".mcp.json"
 
 sys.path.insert(0, str(ROOT))
 from server.models import TIERS, fits, recommend  # noqa: E402  (stdlib-only, safe before the venv)
+from server.portable import (  # noqa: E402  (same -- both are stdlib only)
+    WINDOWS,
+    detach,
+    enable_ansi,
+    env_command,
+    printable,
+    run_command,
+    venv_python,
+)
 
-BOLD, DIM, GREEN, RED, YELLOW, RESET = "\033[1m", "\033[2m", "\033[32m", "\033[31m", "\033[33m", "\033[0m"
+# Colour if this terminal will render it, and nothing if it will not: a console
+# that has not had escape codes switched on prints them instead of obeying them,
+# and a redirected stdout has no business carrying them at all.
+if enable_ansi():
+    BOLD, DIM, GREEN, RED, YELLOW, RESET = (
+        "\033[1m", "\033[2m", "\033[32m", "\033[31m", "\033[33m", "\033[0m"
+    )
+else:
+    BOLD = DIM = GREEN = RED = YELLOW = RESET = ""
 
 
 def say(text: str = "") -> None:
-    print(text, flush=True)
+    print(printable(text), flush=True)
 
 
 def step(text: str) -> None:
@@ -54,11 +72,26 @@ def bad(text: str) -> None:
     say(f"  {RED}✗{RESET} {text}")
 
 
-def ask(question: str, default: bool = True) -> bool:
-    if not sys.stdin.isatty():
+def prompt(question: str, default: str = "") -> str:
+    """Ask, unless there is nobody to ask -- then take the default and carry on.
+
+    isatty() is not the whole answer: a Windows console handed to a script by
+    something else (a CI job, an IDE's run button, a shell that redirected only
+    stdout) can claim to be a terminal and still have nothing behind it, and
+    reading it raises rather than blocks. A wizard whose every question has a
+    sensible default should never die of not being able to ask one.
+    """
+    if not sys.stdin or not sys.stdin.isatty():
         return default
+    try:
+        return input(printable(f"  {question} ")).strip() or default
+    except EOFError:
+        return default
+
+
+def ask(question: str, default: bool = True) -> bool:
     suffix = "[Y/n]" if default else "[y/N]"
-    answer = input(f"  {question} {suffix} ").strip().lower()
+    answer = prompt(f"{question} {suffix}").lower()
     return default if not answer else answer.startswith("y")
 
 
@@ -67,10 +100,6 @@ def run(command: list[str] | str, shell: bool = False) -> int:
 
 
 # ------------------------------------------------------------------- venv
-
-
-def venv_python() -> Path:
-    return VENV / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 
 def ensure_venv() -> bool:
@@ -171,7 +200,7 @@ def ensure_ollama() -> bool:
         if platform.system() == "Darwin":
             say(f"  {DIM}macOS: download the app from https://ollama.com/download{RESET}")
             return False
-        if platform.system() == "Windows":
+        if WINDOWS:
             say(f"  {DIM}Windows: download the installer from https://ollama.com/download{RESET}")
             return False
         pin = os.environ.get("OLLAMA_VERSION", "").strip()
@@ -217,7 +246,8 @@ def ensure_ollama() -> bool:
     log_path = ROOT / "data"
     log_path.mkdir(exist_ok=True)
     log = open(log_path / "ollama-serve.log", "ab", buffering=0)
-    subprocess.Popen([binary, "serve"], stdout=log, stderr=log, start_new_session=True)
+    subprocess.Popen([binary, "serve"], stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                     **detach())
 
     for _ in range(30):
         time.sleep(0.5)
@@ -296,10 +326,7 @@ def ensure_model() -> str | None:
     say(f"  suggested: {BOLD}{best['model']}{RESET} — the largest that fits your card")
     say(f"  {DIM}if pages feel slow, take one size down, or turn Effort down in the browser{RESET}")
 
-    if sys.stdin.isatty():
-        chosen = input(f"  Model to pull [{best['model']}]: ").strip() or best["model"]
-    else:
-        chosen = best["model"]
+    chosen = prompt(f"Model to pull [{best['model']}]:", default=best["model"])
 
     return chosen if pull(chosen) else None
 
@@ -311,13 +338,59 @@ def write_settings(model: str) -> None:
     settings = {}
     if path.exists():
         try:
-            settings = json.loads(path.read_text())
+            settings = json.loads(path.read_text("utf-8"))
         except Exception:
             settings = {}
     settings["model"] = model
     settings.setdefault("ollamaUrl", DEFAULT_ENDPOINT)
-    path.write_text(json.dumps(settings, indent=2))
+    path.write_text(json.dumps(settings, indent=2), "utf-8")
     ok(f"settings.json points at {model}")
+
+
+# --------------------------------------------------------------------- mcp
+# .mcp.json is committed, and the interpreter it names has to resolve on every
+# machine that clones this. The venv's own path cannot: it is .venv/bin/python
+# on POSIX and .venv\Scripts\python.exe on Windows, and one file can only
+# spell one of them. So the config says `python` -- which is what mcp_server.py
+# expects, because it hands itself over to the venv on the way up -- and this
+# only rewrites it for the machines where even that does not resolve, which is
+# a Linux without python-is-python3 and a macOS since 12.3.
+
+
+def mcp_command_works(command: str) -> bool:
+    """Can this machine actually start an MCP server with that command?"""
+    binary = shutil.which(command) or (command if Path(command).exists() else "")
+    if not binary:
+        return False
+    try:
+        return subprocess.run([binary, "-c", "import sys"], capture_output=True, timeout=15).returncode == 0
+    except Exception:
+        return False
+
+
+def ensure_mcp_config() -> None:
+    """Leave .mcp.json alone if it works here; point it at the venv if it doesn't."""
+    step("Claude Code")
+    if not MCP_CONFIG.exists():
+        warn(".mcp.json is missing — Claude Code won't see the browser")
+        return
+
+    try:
+        config = json.loads(MCP_CONFIG.read_text("utf-8"))
+        entry = config["mcpServers"]["offline-browser"]
+    except Exception:
+        warn(".mcp.json is not the shape this expects — leaving it alone")
+        return
+
+    command = str(entry.get("command", ""))
+    if mcp_command_works(command):
+        ok(f"`{command} mcp_server.py` starts the browser for Claude Code")
+        return
+
+    entry["command"] = str(venv_python())
+    MCP_CONFIG.write_text(json.dumps(config, indent=2) + "\n", "utf-8")
+    warn(f"`{command}` doesn't resolve here — .mcp.json now names the venv directly")
+    say(f"  {DIM}that edit is local: this machine's path, nobody else's{RESET}")
 
 
 def main() -> int:
@@ -327,9 +400,13 @@ def main() -> int:
     if not ensure_venv():
         return 1
 
+    ensure_mcp_config()
+
     if not ensure_ollama():
         say(f"\n{YELLOW}Ollama isn't ready.{RESET} You can still try the browser with canned pages:")
-        say(f"  {BOLD}HLG_MOCK=1 {venv_python()} run.py{RESET}")
+        say(f"  {BOLD}{env_command({'HLG_MOCK': '1'}, run_command())}{RESET}")
+        say("  or let Claude Code write them instead:")
+        say(f"  {BOLD}{env_command({'HLG_LLM': 'claude'}, run_command())}{RESET}")
         return 1
 
     model = ensure_model()
@@ -338,7 +415,7 @@ def main() -> int:
     write_settings(model)
 
     step("Ready")
-    say(f"  start it with:  {BOLD}{venv_python()} run.py{RESET}")
+    say(f"  start it with:  {BOLD}{run_command()}{RESET}")
     say(f"  then open:      {BOLD}http://127.0.0.1:8765{RESET}\n")
     return 0
 

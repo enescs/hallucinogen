@@ -1,9 +1,16 @@
 #!/usr/bin/env python
-"""Start the browser.
+r"""Start the browser.
 
     .venv/bin/python run.py                   # talk to Ollama
     HLG_MOCK=1 .venv/bin/python run.py        # canned pages, no model needed
     HLG_LLM=claude .venv/bin/python run.py    # Claude writes them, over MCP
+
+The same three on Windows, where the venv keeps its interpreter somewhere else
+and PowerShell sets a variable rather than prefixing a command with it:
+
+    .venv\Scripts\python.exe run.py
+    $env:HLG_MOCK="1"; .venv\Scripts\python.exe run.py
+    $env:HLG_LLM="claude"; .venv\Scripts\python.exe run.py
 
 Environment: PORT, HLG_HOST, HLG_ALLOW_PUBLIC, HLG_RELOAD, HLG_MOCK, HLG_LLM
 """

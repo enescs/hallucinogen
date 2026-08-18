@@ -20,6 +20,18 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 HLG_MOCK=1 .venv/bin/python run.py
 ```
 
+```powershell
+python -m venv .venv; .venv\Scripts\pip.exe install -r requirements.txt
+$env:HLG_MOCK="1"; .venv\Scripts\python.exe run.py
+```
+
+Both platforms are supported and both are worth keeping working. Where they
+genuinely differ — where the venv puts its interpreter, how a background process
+is detached, whether a console can be written to in colour and in UTF-8, how a
+command is spelled for a reader to paste — the branch belongs in
+`server/portable.py` rather than as another `if os.name == "nt"` somewhere in
+code that is otherwise about browsing.
+
 Mock mode serves canned pages with no model involved, which is the fastest way
 to work on the chrome, the stylesheets or the search page. Anything touching
 prompts or generation needs a real model — `qwen3:4b` is quick enough to iterate

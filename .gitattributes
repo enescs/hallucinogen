@@ -1,0 +1,13 @@
+# One line ending in the repository and one in every working copy, whichever
+# platform it was cloned onto. Without this a Windows clone with core.autocrlf
+# on rewrites every file to CRLF on the way out and back again on the way in,
+# and the first contributor without that setting commits a whole file as
+# changed. Python does not care and neither does the browser, but a diff full
+# of invisible changes hides the real one.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff binary
+*.woff2 binary

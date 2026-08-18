@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^(WebSearch|WebFetch|mcp__(?!offline-browser__).*)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"$CLAUDE_PROJECT_DIR/.claude/hooks/no_external_sources.py\"",
+            "timeout": 5,
+            "statusMessage": "checking the browser isn't being served"
+          }
+        ]
+      }
+    ]
+  }
+}

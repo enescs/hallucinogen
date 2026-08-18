@@ -20,6 +20,7 @@ import httpx
 
 from . import ollama, store
 from .models import TIERS, fits, recommend as recommend_model
+from .portable import WINDOWS, detach
 
 INSTALL_URL = "https://ollama.com/install.sh"
 DOWNLOAD_URL = "https://ollama.com/download"
@@ -27,7 +28,7 @@ DOWNLOAD_URL = "https://ollama.com/download"
 # What to tell someone who has to install it themselves. There is no unattended
 # path on Windows -- the install script is sh, so it's the installer or nothing.
 INSTALL_HINT = (
-    f"download the installer from {DOWNLOAD_URL}" if os.name == "nt" else f"curl -fsSL {INSTALL_URL} | sh"
+    f"download the installer from {DOWNLOAD_URL}" if WINDOWS else f"curl -fsSL {INSTALL_URL} | sh"
 )
 
 
@@ -108,7 +109,7 @@ def _is_root() -> bool:
 def can_install_unattended() -> bool:
     # The installer is a shell script and the tuning is a systemd drop-in, so
     # neither has anything to do on Windows.
-    if os.name == "nt":
+    if WINDOWS:
         return False
     if _is_root():
         return True
@@ -186,9 +187,18 @@ OVERRIDE_FILE = f"{OVERRIDE_DIR}/10-hallucinogen.conf"
 
 _OVERRIDE_BODY = "[Service]\n" + "".join(f'Environment="{k}={v}"\n' for k, v in TUNING.items())
 
-MANUAL_COMMAND = "systemctl edit ollama   # then add, under [Service]:\n" + "".join(
-    f'Environment="{k}={v}"\n' for k, v in TUNING.items()
-)
+# What to tell someone who has to set these themselves. Windows has no systemd
+# unit to edit and no shell to export from: the Ollama service there reads the
+# machine's own environment, so the equivalent is setx and a restart of the app.
+if WINDOWS:
+    MANUAL_COMMAND = "\n".join(
+        [*(f"setx {k} {v}" for k, v in TUNING.items()),
+         "# then quit Ollama from the tray and start it again"]
+    )
+else:
+    MANUAL_COMMAND = "systemctl edit ollama   # then add, under [Service]:\n" + "".join(
+        f'Environment="{k}={v}"\n' for k, v in TUNING.items()
+    )
 
 
 def _systemd_unit_exists() -> bool:
@@ -204,7 +214,15 @@ def _systemd_unit_exists() -> bool:
 
 
 def daemon_env() -> dict:
-    """What the running ollama unit actually has set, as far as systemd will say."""
+    """What the ollama daemon actually has set, as far as it can be asked.
+
+    On Windows the daemon is a tray app started from the user's own environment
+    rather than a unit with an Environment= list, so the machine environment is
+    both where the settings go and the only place to read them back from -- and
+    this process inherited it.
+    """
+    if WINDOWS:
+        return {key: os.environ.get(key, "") for key in TUNING}
     if not shutil.which("systemctl"):
         return {}
     try:
@@ -222,13 +240,21 @@ def daemon_env() -> dict:
 
 
 def tuning_status() -> dict:
-    """Is the daemon tuned, can we tune it from here, and what would it take."""
+    """Is the daemon tuned, can we tune it from here, and what would it take.
+
+    `supported` is about the settings, `canApply` about this page: Ollama honours
+    both variables on Windows exactly as it does under systemd, and the only
+    thing missing there is a unit file this could edit for you. Reporting the
+    whole thing unsupported would hide the advice from the readers who need it
+    most -- an 8 GB card is an 8 GB card on either platform.
+    """
     systemd = _systemd_unit_exists()
-    env = daemon_env() if systemd else {}
+    supported = systemd or WINDOWS
+    env = daemon_env() if supported else {}
     missing = [key for key, value in TUNING.items() if env.get(key) != value]
     return {
-        "supported": systemd,
-        "applied": systemd and not missing,
+        "supported": supported,
+        "applied": supported and not missing,
         "missing": missing,
         "current": {key: env.get(key, "") for key in TUNING},
         "canApply": systemd and can_install_unattended(),
@@ -244,8 +270,7 @@ async def tune_daemon() -> AsyncIterator[dict]:
         yield {
             "type": "error",
             "message": "This Ollama isn't running under systemd, so there's no unit to edit.",
-            "hint": "Export these before `ollama serve` instead:  "
-            + "  ".join(f"{k}={v}" for k, v in TUNING.items()),
+            "hint": f"Set them yourself instead:  {MANUAL_COMMAND}",
         }
         return
     if status_now["applied"]:
@@ -255,7 +280,11 @@ async def tune_daemon() -> AsyncIterator[dict]:
     if not status_now["canApply"]:
         yield {
             "type": "error",
-            "message": "Editing the Ollama service needs administrator rights, which this page can't ask for.",
+            "message": (
+                "Windows keeps these in the machine environment, not in a service file this page can edit."
+                if WINDOWS
+                else "Editing the Ollama service needs administrator rights, which this page can't ask for."
+            ),
             "hint": f"Run this in a terminal instead:  {MANUAL_COMMAND}",
         }
         return
@@ -374,8 +403,11 @@ async def start_server() -> AsyncIterator[dict]:
             return
 
     yield {"type": "log", "text": "starting ollama serve…"}
+    store.DATA.mkdir(parents=True, exist_ok=True)
     log = open(store.DATA / "ollama-serve.log", "ab", buffering=0)
-    subprocess.Popen([binary, "serve"], stdout=log, stderr=log, start_new_session=True)
+    # Detached, so the daemon isn't a child of the browser it outlives: on POSIX
+    # its own session, on Windows its own console-less process.
+    subprocess.Popen([binary, "serve"], stdin=subprocess.DEVNULL, stdout=log, stderr=log, **detach())
 
     for _ in range(30):
         await asyncio.sleep(0.5)

@@ -14,9 +14,12 @@ up, write the page, and hand it back:
                                        (consumes) <---- POST /api/llm/respond
                                                               (x N)
 
-The worker is an MCP server, and through it Claude. There is no pool and no
-fan-out: one page is written at a time, the same as with a local model, because
-the thing on the other end is a conversation and conversations are serial.
+The worker is an MCP server, and through it Claude. A conversation is serial, so
+one worker writes one page at a time -- but there can be several of them pulling
+on this one queue, and unlike a local model they do not contend for a GPU. Which
+makes the order they pull in matter: every job carries a priority, a page a
+reader is watching outranks one nobody has clicked, and waiting counts towards
+the order so nothing at the bottom of it starves.
 
 An answer arrives in pieces, not all at once. A tool call is atomic -- the server
 sees nothing of it until the model has finished writing every argument -- so a
@@ -35,6 +38,7 @@ when nothing has ever attached.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import re
 import secrets
 import time
@@ -53,6 +57,32 @@ NO_WORKER_TIMEOUT = 25.0
 # itself when it starts and heartbeats while it is up.
 WORKER_TTL = 150.0
 
+# What goes out first when more than one thing is waiting. Lower is sooner.
+# There can be several workers now, and speculation is back on for this backend,
+# so the queue holds work of two quite different kinds: pages somebody is
+# watching a tab for, and pages nobody has asked for yet. Without an order, a
+# guess that arrived 200ms before the reader pressed enter is written in front
+# of the page they are actually waiting on.
+P_LIVE = 0  # a reader is watching a tab for this
+P_WARM = 5  # a site profile, guessed at ahead of the page that will need it
+P_GUESS = 10  # a whole page nobody has clicked
+DEFAULT_PRIORITY = P_LIVE
+
+# ...and every 20 seconds of waiting counts as one step up the order, or a
+# reader who keeps browsing means a guess is never written at all -- it just
+# sits behind whatever they did next, forever, holding a slot.
+AGE_STEP = 20.0
+
+# A job handed to a worker that then writes nothing is a tab waiting on nobody.
+# Past the lease, and with not one piece delivered, it goes back in the queue --
+# see _reclaim() for why the id changes when it does. The poll lease is long
+# because a worker that took a job over `next_request` is usually just thinking;
+# the piggyback one is short because that hand-over is the one that can be
+# missed silently (the brief rides back on a write_page result, and a worker
+# that ignores it never says so).
+POLL_LEASE = 180.0
+PIGGYBACK_LEASE = 45.0
+
 
 class WorkerError(Exception):
     """The worker took the job and then said it couldn't do it."""
@@ -62,8 +92,8 @@ class Job:
     """One request for text, and the queue the answer arrives on."""
 
     __slots__ = (
-        "id", "kind", "label", "messages", "schema", "max_tokens", "stop",
-        "created", "announced", "chunks", "parts", "settled",
+        "id", "kind", "label", "messages", "schema", "max_tokens", "stop", "priority",
+        "created", "announced", "lease", "first_piece", "chunks", "parts", "settled",
     )
 
     def __init__(
@@ -74,6 +104,7 @@ class Job:
         schema: dict | None,
         max_tokens: int,
         stop: list[str],
+        priority: int = DEFAULT_PRIORITY,
     ) -> None:
         self.id = secrets.token_hex(3)
         self.kind = kind
@@ -82,8 +113,14 @@ class Job:
         self.schema = schema
         self.max_tokens = max_tokens
         self.stop = stop
+        self.priority = priority
         self.created = time.monotonic()
         self.announced: float | None = None
+        self.lease: float = POLL_LEASE
+        # When the first piece landed, which is when the reader stopped looking
+        # at an empty column. The number worth optimising, and the one nothing
+        # was measuring: `stats.totalMs` is the whole answer, end to end.
+        self.first_piece: float | None = None
         # (part, text) as the worker hands pieces over, then None for the end --
         # or a WorkerError, for a worker that took the job and gave up on it.
         self.chunks: asyncio.Queue[Any] = asyncio.Queue()
@@ -122,7 +159,18 @@ class Job:
             "request": self.request,
             "schema": self.schema,
             "maxTokens": self.max_tokens,
+            "priority": self.priority,
             "waitingMs": round((time.monotonic() - self.created) * 1000),
+        }
+
+    def timings(self) -> dict[str, Any]:
+        """Where the reader's wait actually went."""
+        now = time.monotonic()
+        return {
+            "queuedMs": round(((self.announced or now) - self.created) * 1000),
+            "firstPieceMs": round(((self.first_piece or now) - self.created) * 1000),
+            "totalMs": round((now - self.created) * 1000),
+            "pieces": len(self.parts),
         }
 
 
@@ -130,6 +178,24 @@ _jobs: dict[str, Job] = {}
 _waiters: list[asyncio.Future] = []
 _worker_seen: float = 0.0
 _served = 0
+
+# What a job submitted from here should be worth, set by whoever knows: the
+# generator, once, at the top of the request. A ContextVar rather than an
+# argument because the provider interface is `chat_stream(settings, messages,
+# ...)` and every backend shares it -- threading a priority through it for the
+# one backend that has a queue would put a browser concept in ollama's
+# signature. Tasks copy the context they were created in, so the site profile
+# spawned inside a live request inherits that request's priority, which is
+# exactly right: a reader is waiting on it too.
+_priority: contextvars.ContextVar[int] = contextvars.ContextVar("hlg_priority", default=DEFAULT_PRIORITY)
+
+
+def set_priority(level: int) -> None:
+    _priority.set(level)
+
+
+def current_priority() -> int:
+    return _priority.get()
 
 
 # ---------------------------------------------------------------- the requester
@@ -143,8 +209,12 @@ def submit(
     schema: dict | None = None,
     max_tokens: int = 0,
     stop: list[str] | None = None,
+    priority: int | None = None,
 ) -> Job:
-    job = Job(kind, label, messages, schema, max_tokens, list(stop or []))
+    job = Job(
+        kind, label, messages, schema, max_tokens, list(stop or []),
+        current_priority() if priority is None else priority,
+    )
     _jobs[job.id] = job
     _wake()
     return job
@@ -194,17 +264,52 @@ def _wake() -> None:
     _waiters.clear()
 
 
-def _next() -> Job | None:
-    """The oldest job no worker has been shown yet."""
-    fresh = sorted(
-        (j for j in _jobs.values() if j.announced is None and not j.settled),
-        key=lambda j: j.created,
-    )
+def _reclaim(now: float) -> None:
+    """Give back a job handed to a worker that never wrote a word of it.
+
+    Only ever a job with no pieces: half an answer on the reader's screen and
+    a second worker continuing it from its own idea of where it was would
+    splice two pages together, which is worse than the stall.
+
+    The id changes on the way back, and that is the whole safety of this. A
+    worker that was merely slow and delivers after the lease finds no such
+    request -- the failure `deliver` already returns and the worker already
+    knows how to read -- instead of appending its version to a page somebody
+    else is now writing. The Job object is untouched, so the reader's stream
+    never notices: it holds the job, not the id.
+    """
+    for job in list(_jobs.values()):
+        if job.settled or job.announced is None or job.parts:
+            continue
+        if now - job.announced <= job.lease:
+            continue
+        _jobs.pop(job.id, None)
+        job.id = secrets.token_hex(3)
+        job.announced = None
+        _jobs[job.id] = job
+
+
+def _rank(job: Job, now: float) -> tuple[float, float]:
+    """Priority first, with waiting counting towards it, then oldest."""
+    return (job.priority - (now - job.created) / AGE_STEP, job.created)
+
+
+def _next(lease: float = POLL_LEASE) -> Job | None:
+    """The job that should be written next, and nobody has been shown yet."""
+    now = time.monotonic()
+    _reclaim(now)
+    fresh = [j for j in _jobs.values() if j.announced is None and not j.settled]
     if not fresh:
         return None
-    job = fresh[0]
-    job.announced = time.monotonic()
+    job = min(fresh, key=lambda j: _rank(j, now))
+    job.announced = now
+    job.lease = lease
     return job
+
+
+def take_next(lease: float = POLL_LEASE) -> Job | None:
+    """Claim the next job without waiting for one. For the piggyback path."""
+    return _next(lease)
 
 
 async def wait_for_job(timeout: float = 25.0) -> Job | None:
@@ -245,6 +350,8 @@ def deliver(job_id: str, text: str, part: str = "", more: bool = False) -> dict:
     if job.settled:
         return {"ok": False, "reason": "that request is already settled"}
 
+    if job.first_piece is None:
+        job.first_piece = time.monotonic()
     job.parts.append(text)
     job.chunks.put_nowait((part, text))
     if not more:
@@ -260,6 +367,7 @@ def deliver(job_id: str, text: str, part: str = "", more: bool = False) -> dict:
         "open": more,
         "kind": job.kind,
         "label": job.label,
+        "timings": job.timings(),
     }
 
 
@@ -323,11 +431,13 @@ def snapshot() -> dict:
                 "id": j.id,
                 "kind": j.kind,
                 "label": j.label,
+                "priority": j.priority,
                 "announced": j.announced is not None,
                 "pieces": len(j.parts),
                 "waitingMs": round((now - j.created) * 1000),
+                "firstPieceMs": round((j.first_piece - j.created) * 1000) if j.first_piece else None,
             }
-            for j in sorted(waiting, key=lambda j: j.created)
+            for j in sorted(waiting, key=lambda j: _rank(j, now))
         ],
     }
 

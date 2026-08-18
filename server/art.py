@@ -168,10 +168,25 @@ async def commission(alt: str, settings: dict) -> None:
         _inflight.discard(key)
 
 
+def _draws(settings: dict) -> bool:
+    """Is the backend one that can be asked for a drawing at all?
+
+    `draw()` goes to Ollama by name rather than through the provider interface,
+    and deliberately: a picture is 1,600 tokens off the critical path, which is
+    a bargain on a GPU that is idle anyway and a whole page's worth of somebody
+    else's turn on a backend where every call is one. With HLG_LLM=claude there
+    is no daemon to ask, so every uncached description was a doomed connect
+    fired from under a page that was still streaming.
+    """
+    from .generator import provider  # late: prefetch/generator already cycle
+
+    return getattr(provider(settings), "PROVIDER", "ollama") == "ollama"
+
+
 def schedule(alt: str, settings: dict) -> None:
     """Fire-and-forget a commission, if this description is worth one."""
     alt = (alt or "").strip()
-    if len(alt) < 8 or not settings.get("art", True):
+    if len(alt) < 8 or not settings.get("art", True) or not _draws(settings):
         return
     if store._art_key(alt) in _inflight or store.get_art(alt):
         return

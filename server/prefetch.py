@@ -21,7 +21,11 @@ from typing import AsyncIterator
 from . import store
 from .urls import to_url
 
-MAX_JOBS = 1  # the model is serial; more in flight just means more queueing
+# A local model is serial, so more in flight there is only more queueing. A pool
+# of Claude workers is not, and a guess sitting at the bottom of a ranked queue
+# costs a reader nothing -- but every one of them is real tokens, so this stays
+# a small number rather than "as many links as the pointer touched".
+MAX_JOBS = 2
 MAX_SITE_JOBS = 2  # a profile is ~220 tokens, so a couple can queue without being felt
 
 
@@ -100,8 +104,10 @@ def _speculating(settings: dict) -> bool:
     """Both a preference and a property of the backend.
 
     A local model is idle between pages, so a wrong guess costs only electricity.
-    A backend where every call is somebody's turn is never idle, and guessing
-    there spends a real page's worth of work on a link nobody clicked.
+    A backend where every call is somebody's turn spends a real page's worth of
+    work on a link nobody clicked -- affordable only because those jobs are
+    ranked below every page a reader is waiting for, and are picked up by a
+    worker that would otherwise be blocked doing nothing.
     """
     from .generator import speculates  # imported late: generator uses this module
 

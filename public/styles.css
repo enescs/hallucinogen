@@ -261,7 +261,8 @@ button { font: inherit; color: inherit; cursor: pointer; }
 }
 .wiz-pin:focus { border-color: #3b3f56; }
 .wiz-note code { display: block; margin-top: 7px; padding: 9px 11px; background: #0e0f16; border: 1px solid var(--line);
-  border-radius: 7px; color: #b9a6ff; font-size: 12px; user-select: all; }
+  border-radius: 7px; color: #b9a6ff; font-size: 12px; user-select: all;
+  white-space: pre-wrap; }  /* these are multi-line commands: a unit file on Linux, three setx lines on Windows */
 
 .progress-wrap { height: 4px; margin: 14px 16px 0; background: #0e0f16; border-radius: 4px; overflow: hidden; }
 .progress-bar { height: 100%; width: 0; background: var(--grad); transition: width .3s ease; }

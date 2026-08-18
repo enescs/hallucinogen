@@ -22,10 +22,25 @@ That gap is the whole point.
 
 ## Quick start
 
+Linux and macOS:
+
 ```bash
 python3 setup.py           # venv, dependencies, Ollama, and a Qwen sized to your GPU
 .venv/bin/python run.py    # then open http://127.0.0.1:8765
 ```
+
+Windows, in PowerShell — the same wizard, and the same browser:
+
+```powershell
+python setup.py
+.venv\Scripts\python.exe run.py
+```
+
+Only three things differ, and all three are the platform rather than the
+program: the venv keeps its interpreter in `Scripts` instead of `bin`, an
+environment variable is set rather than prefixed, and Ollama arrives as an
+installer from [ollama.com/download](https://ollama.com/download) rather than as
+a shell script the wizard can run for you. Everything after that is identical.
 
 The wizard is happy to be interrupted — everything it does is also a button in
 the browser's own setup panel, which opens by itself when something is missing.
@@ -33,7 +48,10 @@ the browser's own setup panel, which opens by itself when something is missing.
 Want to see the thing move before committing to a 5 GB download:
 
 ```bash
-HLG_MOCK=1 .venv/bin/python run.py     # canned pages, no model involved
+HLG_MOCK=1 .venv/bin/python run.py                     # canned pages, no model involved
+```
+```powershell
+$env:HLG_MOCK="1"; .venv\Scripts\python.exe run.py    # the same, in PowerShell
 ```
 
 Or skip the local model entirely and let Claude write the pages — see
@@ -47,6 +65,13 @@ curl -fsSL https://ollama.com/install.sh | sh
 ollama serve &
 ollama pull qwen3:8b
 .venv/bin/python run.py
+```
+
+```powershell
+python -m venv .venv; .venv\Scripts\pip.exe install -r requirements.txt
+# install Ollama from https://ollama.com/download, then:
+ollama pull qwen3:8b
+.venv\Scripts\python.exe run.py
 ```
 
 ## Speed
@@ -298,6 +323,18 @@ else. `mock.py` was the first proof of it. `claude.py` is the second:
 ```bash
 HLG_LLM=claude .venv/bin/python run.py     # then open Claude Code in this project
 ```
+```powershell
+$env:HLG_LLM="claude"; .venv\Scripts\python.exe run.py
+```
+
+`.mcp.json` starts the MCP server with a bare `python`, because that is the one
+name that resolves on both platforms — the venv's own interpreter is
+`.venv/bin/python` here and `.venv\Scripts\python.exe` there, and a committed file
+can only spell one of them. `mcp_server.py` hands itself over to the venv on the
+way up, so whichever `python` starts it, the dependencies are the venv's. On the
+machines where even a bare `python` resolves to nothing — a Linux without
+`python-is-python3`, a macOS since 12.3 — `setup.py` notices and rewrites
+`.mcp.json` to name the venv directly.
 
 Ask Claude to serve the browser (`/serve-browser`), open the page, and type a
 domain. The tab says what it always says; the difference is who is on the other
@@ -373,7 +410,24 @@ localhost, plus whatever the setup wizard downloads when you press its buttons.
 `HLG_LLM=claude` is the exception, and it is worth stating plainly: the page
 prompts go to Anthropic, because that is where the model is. Everything else
 holds — the browser still fetches nothing, still has no index, still invents
-every page. It just invents them somewhere else. Generated pages
+every page. It just invents them somewhere else. That path is the one where the
+model has tools it could reach for, so the rule is spelled out at every layer it
+passes through — the browser's own hard rules, the MCP server's instructions,
+every request brief, and the `page-writer` agent, which is handed four tools and
+no others: no external sources, none at all. No web search, no fetch, no MCP tool
+from another server, no reading files, no subagent sent to check something. A
+page assembled from real sources is the one page this browser must never serve.
+
+Prose is a request, though, so two things back it up. `.claude/hooks/no_external_sources.py`
+runs as a `PreToolUse` hook: while a worker is attached to the browser, WebSearch,
+WebFetch and every non-`offline-browser` MCP tool are denied before they run, and
+every attempt -- denied or allowed -- is appended to `data/lookups.log`. It gates
+on serving rather than on this directory, so ordinary work on the repo is
+unaffected; `HLG_STRICT_LOOKUPS=1` makes it unconditional and
+`HLG_ALLOW_LOOKUPS=1` stands it down. And `python tools/audit_lookups.py` reads
+back the other direction: it scans Claude Code's transcripts for this project and
+reports any session that both wrote pages and reached outside, including sessions
+from before the hook existed. Generated pages
 are locked down harder than that: a strict CSP (`default-src 'none'`,
 `connect-src 'none'`) and a guard script that replaces `fetch`, `XMLHttpRequest`,
 `WebSocket` and `window.open` before any page script runs. Links and form

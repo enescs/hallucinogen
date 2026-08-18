@@ -236,12 +236,27 @@ async def api_llm_respond(body: dict = Body(default={})):
     HTML for a page, JSON for a profile or a search. `more` says another piece is
     coming and keeps the request open; `part` labels one that isn't page text --
     "site" is the profile half of a batched first visit.
+
+    A finished answer takes the next request with it, if one is waiting. The
+    worker is about to ask for one anyway, and asking costs it a whole turn --
+    the model has to be handed the receipt, decide, and call `next_request`
+    before the browser can even announce what it has been holding. Riding back
+    on the receipt deletes that turn from every page but the first.
     """
     request_id = str(body.get("id") or "").strip()
     content = body.get("content")
     if not request_id or not isinstance(content, str):
         return JSONResponse({"ok": False, "reason": "id and content are both required"}, status_code=400)
-    return broker.deliver(request_id, content, part=str(body.get("part") or ""), more=bool(body.get("more")))
+    more = bool(body.get("more"))
+    result = broker.deliver(request_id, content, part=str(body.get("part") or ""), more=more)
+    if result.get("ok") and not more and bool(body.get("next", True)):
+        # A short lease on this one: a hand-over the worker never acknowledges
+        # is invisible, so the browser takes it back quickly rather than leaving
+        # a tab waiting on a brief that was read as flavour text.
+        job = broker.take_next(broker.PIGGYBACK_LEASE)
+        if job is not None:
+            result = {**result, "next": job.payload()}
+    return result
 
 
 @app.post("/api/llm/fail")

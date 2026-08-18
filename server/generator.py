@@ -31,7 +31,7 @@ import re
 import time
 from typing import Any, AsyncIterator
 
-from . import claude, fallback, mock, ollama, prefetch, prompts, serp, store, theme
+from . import broker, claude, fallback, mock, ollama, prefetch, prompts, serp, store, theme
 from .stream_filters import _MAIN_RE, HtmlCleaner, close_fragment, extract_heading, extract_title
 from .urls import SEARCH_ENDPOINT, domain_of, guess_site_name, is_search, path_of, query_of, to_url
 
@@ -60,7 +60,9 @@ def speculates(settings: dict) -> bool:
     """Is the backend one that should be given work nobody has asked for?
 
     Ollama is idle between pages and a wrong guess costs only electricity. A turn
-    of Claude's is not idle time, so hovering does not commission a page there.
+    of Claude's is not idle time either -- what makes a guess affordable there is
+    that it is queued behind everything a reader is waiting for (broker.P_GUESS)
+    and picked up by a worker with nothing else to do.
     """
     return bool(getattr(provider(settings), "SPECULATIVE", True))
 
@@ -221,6 +223,9 @@ async def warm_site_profile(domain: str, referrer: str = "") -> dict | None:
     """Generate a site profile ahead of anyone asking for a page on it."""
     if store.get_site(domain):
         return None
+    # Nobody is watching a tab for this one yet -- but it is 220 tokens that
+    # will otherwise block a page, so it outranks guessing at a whole page.
+    broker.set_priority(broker.P_WARM)
     settings = store.get_settings()
     llm = provider(settings)
     era = str(settings.get("style", "modern"))
@@ -293,6 +298,11 @@ async def stream_page(
     settings = store.get_settings()
     url = to_url(q, from_url or None)
     domain = domain_of(url)
+
+    # What everything this request asks for is worth, set once, here. Anything
+    # submitted below inherits it -- including the site profile, which is spawned
+    # as its own task and copies this context when it is created.
+    broker.set_priority(broker.P_GUESS if speculative else broker.P_LIVE)
 
     # A real navigation outranks every guess we were making -- the page guesses,
     # and the profile guesses too. Ollama has no priority queue, so anything
